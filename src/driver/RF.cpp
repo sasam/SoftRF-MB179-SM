@@ -1,0 +1,3058 @@
+/*
+ * RFHelper.cpp
+ * Copyright (C) 2016-2021 Linar Yusupov
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#if defined(ARDUINO)
+#include <SPI.h>
+#endif /* ARDUINO */
+
+#include "RF.h"
+#include "../system/Time.h"
+#include "../system/SoC.h"
+#include "../TrafficHelper.h"
+#include "Settings.h"
+#include "Battery.h"
+#include "../ui/Web.h"
+#if !defined(EXCLUDE_MAVLINK)
+#include "../protocol/data/MAVLink.h"
+#endif /* EXCLUDE_MAVLINK */
+#include <fec.h>
+
+#if LOGGER_IS_ENABLED
+#include "../system/Log.h"
+#endif /* LOGGER_IS_ENABLED */
+
+byte RxBuffer[MAX_PKT_SIZE] __attribute__((aligned(sizeof(uint32_t))));
+
+//time_t RF_time;
+uint32_t RF_time;
+uint8_t RF_current_slot = 0;
+uint8_t RF_current_chan = 0;
+uint32_t RF_OK_from   = 0;
+uint32_t RF_OK_until  = 0;
+uint32_t TxTimeMarker = 0;
+uint32_t TxTimeMarker2 = 0;
+uint32_t TxEndMarker  = 0;
+byte TxBuffer[MAX_PKT_SIZE] __attribute__((aligned(sizeof(uint32_t))));
+
+uint32_t tx_packets_counter = 0;
+uint32_t rx_packets_counter = 0;
+
+int8_t which_rx_try = 0;
+int8_t RF_last_rssi = 0;
+uint32_t RF_last_crc = 0;
+uint8_t RF_last_protocol = 0;
+uint8_t current_RX_protocol;
+uint8_t current_TX_protocol;
+uint8_t dual_protocol = RF_SINGLE_PROTOCOL;
+bool rx_flr_adsl = false;
+
+FreqPlan RF_FreqPlan;
+static bool RF_ready = false;
+
+static size_t RF_tx_size = 0;
+
+const rfchip_ops_t *rf_chip = NULL;
+bool RF_SX12XX_RST_is_connected = true;
+
+const char *Protocol_ID[] = {
+  [RF_PROTOCOL_NONE]      = "---",  // 0
+  [RF_PROTOCOL_OGNTP]     = "OGN",
+  [RF_PROTOCOL_P3I]       = "P3I",
+  [RF_PROTOCOL_ADSB_1090] = "ADS",
+  [RF_PROTOCOL_ADSB_UAT]  = "UAT",
+  [RF_PROTOCOL_FANET]     = "FAN",
+  [RF_PROTOCOL_LEGACY]    = "LEG",
+  [RF_PROTOCOL_LATEST]    = "LAT",
+  [RF_PROTOCOL_ADSL]      = "ADL",  // 8
+  [RF_PROTOCOL_GDL90]     = "GDL"   // 9 - not an RF protocol
+};
+
+struct protocol_duo
+{
+    const uint8_t main;
+    const uint8_t alt;
+    const char *label;
+};
+
+protocol_duo protocol_duos[] = {
+  {RF_PROTOCOL_LEGACY, RF_PROTOCOL_LATEST, "L+T"},
+  {RF_PROTOCOL_LEGACY, RF_PROTOCOL_OGNTP,  "L+O"},
+  {RF_PROTOCOL_LEGACY, RF_PROTOCOL_ADSL,   "L+A"},
+  {RF_PROTOCOL_LATEST, RF_PROTOCOL_LEGACY, "T+L"},
+  {RF_PROTOCOL_LATEST, RF_PROTOCOL_OGNTP,  "T+O"},
+  {RF_PROTOCOL_LATEST, RF_PROTOCOL_ADSL,   "T+A"},
+  {RF_PROTOCOL_LATEST, RF_PROTOCOL_FANET,  "TFa"},
+  {RF_PROTOCOL_LATEST, RF_PROTOCOL_P3I,    "T+P"},
+  {RF_PROTOCOL_OGNTP,  RF_PROTOCOL_LEGACY, "O+L"},
+  {RF_PROTOCOL_OGNTP,  RF_PROTOCOL_LATEST, "O+T"},
+  {RF_PROTOCOL_OGNTP,  RF_PROTOCOL_ADSL,   "O+A"},
+  {RF_PROTOCOL_ADSL,   RF_PROTOCOL_OGNTP,  "A+O"},
+  {RF_PROTOCOL_ADSL,   RF_PROTOCOL_LEGACY, "A+L"},
+  {RF_PROTOCOL_ADSL,   RF_PROTOCOL_LATEST, "A+T"},
+  {RF_PROTOCOL_FANET,  RF_PROTOCOL_LATEST, "F+T"},
+  {RF_PROTOCOL_FANET,  RF_PROTOCOL_OGNTP,  "F+O"},
+  {RF_PROTOCOL_FANET,  RF_PROTOCOL_ADSL,   "F+A"},
+  {RF_PROTOCOL_P3I,    RF_PROTOCOL_LATEST, "P+T"},
+  {RF_PROTOCOL_P3I,    RF_PROTOCOL_OGNTP,  "P+O"},
+  {RF_PROTOCOL_P3I,    RF_PROTOCOL_ADSL,   "P+A"},
+  {RF_PROTOCOL_NONE, RF_PROTOCOL_NONE, NULL}
+};
+
+const char *protocol_lbl(uint8_t main, uint8_t alt)
+{
+    if (alt == RF_PROTOCOL_NONE)
+        return Protocol_ID[main];
+    for (int i=0; ; i++) {
+        if (protocol_duos[i].label == NULL)
+            return "???";
+        if (protocol_duos[i].main == main && protocol_duos[i].alt == alt)
+            return protocol_duos[i].label;
+    }
+}
+
+const char *dual_protocol_lbl[] = {
+  [RF_SINGLE_PROTOCOL] = "PROTOCOL",
+  [RF_FLR_ADSL]        = "FLR_ADSL",
+  [RF_FLR_FANET]       = "FLR_FANET",
+  [RF_FLR_P3I]         = "FLR_P3I"
+};
+
+size_t (*protocol_encode)(void *, container_t *);
+size_t (*mainprotocol_encode)(void *, container_t *);
+size_t (*altprotocol_encode)(void *, container_t *);
+bool   (*protocol_decode)(void *, container_t *, ufo_t *);
+bool   (*mainprotocol_decode)(void *, container_t *, ufo_t *);
+bool   (*altprotocol_decode)(void *, container_t *, ufo_t *);
+const rf_proto_desc_t  *curr_rx_protocol_ptr;
+const rf_proto_desc_t  *curr_tx_protocol_ptr;
+const rf_proto_desc_t  *mainprotocol_ptr;
+const rf_proto_desc_t  *altprotocol_ptr;
+
+static Slots_descr_t Time_Slots, *ts;
+static uint8_t       RF_timing = RF_TIMING_INTERVAL;
+
+extern const gnss_chip_ops_t *gnss_chip;
+
+#define RF_CHANNEL_NONE 0xFF
+
+static bool nrf905_probe(void);
+static void nrf905_setup(void);
+static void nrf905_channel(uint8_t);
+static bool nrf905_receive(void);
+static void nrf905_transmit(void);
+static void nrf905_shutdown(void);
+
+static bool sx1276_probe(void);
+static bool sx1262_probe(void);
+static void sx12xx_setup(void);
+static void sx12xx_channel(uint8_t);
+static bool sx12xx_receive(void);
+static void sx12xx_transmit(void);
+static void sx1276_shutdown(void);
+static void sx1262_shutdown(void);
+
+static bool uatm_probe(void);
+static void uatm_setup(void);
+static void uatm_channel(uint8_t);
+static bool uatm_receive(void);
+static void uatm_transmit(void);
+static void uatm_shutdown(void);
+
+static bool cc13xx_probe(void);
+static void cc13xx_setup(void);
+static void cc13xx_channel(uint8_t);
+static bool cc13xx_receive(void);
+static void cc13xx_transmit(void);
+static void cc13xx_shutdown(void);
+
+static bool ognrf_probe(void);
+static void ognrf_setup(void);
+static void ognrf_channel(uint8_t);
+static bool ognrf_receive(void);
+static void ognrf_transmit(void);
+static void ognrf_shutdown(void);
+
+#if !defined(EXCLUDE_NRF905)
+const rfchip_ops_t nrf905_ops = {
+  RF_IC_NRF905,
+  "NRF905",
+  nrf905_probe,
+  nrf905_setup,
+  nrf905_channel,
+  nrf905_receive,
+  nrf905_transmit,
+  nrf905_shutdown
+};
+#endif
+#if !defined(EXCLUDE_SX12XX)
+const rfchip_ops_t sx1276_ops = {
+  RF_IC_SX1276,
+  "SX127x",
+  sx1276_probe,
+  sx12xx_setup,
+  sx12xx_channel,
+  sx12xx_receive,
+  sx12xx_transmit,
+  sx1276_shutdown
+};
+#if defined(USE_BASICMAC)
+const rfchip_ops_t sx1262_ops = {
+  RF_IC_SX1262,
+  "SX126x",
+  sx1262_probe,
+  sx12xx_setup,
+  sx12xx_channel,
+  sx12xx_receive,
+  sx12xx_transmit,
+  sx1262_shutdown
+};
+#endif /* USE_BASICMAC */
+#endif /*EXCLUDE_SX12XX */
+#if !defined(EXCLUDE_UATM)
+const rfchip_ops_t uatm_ops = {
+  RF_IC_UATM,
+  "UATM",
+  uatm_probe,
+  uatm_setup,
+  uatm_channel,
+  uatm_receive,
+  uatm_transmit,
+  uatm_shutdown
+};
+#endif /* EXCLUDE_UATM */
+#if !defined(EXCLUDE_CC13XX)
+const rfchip_ops_t cc13xx_ops = {
+  RF_IC_CC13XX,
+  "CC13XX",
+  cc13xx_probe,
+  cc13xx_setup,
+  cc13xx_channel,
+  cc13xx_receive,
+  cc13xx_transmit,
+  cc13xx_shutdown
+};
+#endif /* EXCLUDE_CC13XX */
+#if defined(USE_OGN_RF_DRIVER)
+
+#define vTaskDelay  delay
+
+#if defined(WITH_SI4X32)
+#include <rf/si4x32/rfm.h>
+#else
+#include <rf/combo/rfm.h>
+#endif /* WITH_SI4X32 */
+
+const rfchip_ops_t ognrf_ops = {
+  RF_DRV_OGN,
+  "OGNDRV",
+  ognrf_probe,
+  ognrf_setup,
+  ognrf_channel,
+  ognrf_receive,
+  ognrf_transmit,
+  ognrf_shutdown
+};
+#endif /* USE_OGN_RF_DRIVER */
+
+String Bin2Hex(byte *buffer, size_t size)
+{
+  String str = "";
+  for (int i=0; i < size; i++) {
+    byte c = buffer[i];
+    str += (c < 0x10 ? "0" : "") + String(c, HEX);
+  }
+  return str;
+}
+
+uint8_t parity(uint32_t x) {
+    uint8_t parity=0;
+    while (x > 0) {
+      if (x & 0x1) {
+          parity++;
+      }
+      x >>= 1;
+    }
+    // return (parity % 2);
+    return (parity & 0x01);
+}
+
+#if !defined(EXCLUDE_NRF905)
+/*
+ * NRF905-specific code
+ *
+ *
+ */
+
+static uint8_t nrf905_channel_prev = RF_CHANNEL_NONE;
+static bool nrf905_receive_active  = false;
+
+static bool nrf905_probe()
+{
+  uint8_t addr[4];
+  uint8_t ref[] = TXADDR;
+
+  digitalWrite(CS_N, HIGH);
+  pinMode(CS_N, OUTPUT);
+
+  SoC->SPI_begin();
+
+#if defined(ARDUINO) && !defined(RASPBERRY_PI)
+  SPI.setClockDivider(SPI_CLOCK_DIV2);
+#endif /* ARDUINO */
+
+  digitalWrite(CS_N, LOW);
+
+  SPI.transfer(NRF905_CMD_R_TX_ADDRESS);
+  for(uint8_t i=4;i--;) {
+    addr[i] = SPI.transfer(NRF905_CMD_NOP);
+  }
+
+  digitalWrite(CS_N, HIGH);
+  pinMode(CS_N, INPUT);
+
+  SPI.end();
+
+#if 0
+  delay(3000);
+  Serial.print("NRF905 probe: ");
+  Serial.print(addr[0], HEX); Serial.print(" ");
+  Serial.print(addr[1], HEX); Serial.print(" ");
+  Serial.print(addr[2], HEX); Serial.print(" ");
+  Serial.print(addr[3], HEX); Serial.print(" ");
+  Serial.println();
+#endif
+
+  /* Cold start state */
+  if ((addr[0] == 0xE7) && (addr[1] == 0xE7) && (addr[2] == 0xE7) && (addr[3] == 0xE7)) {
+    return true;
+  }
+
+  /* Warm restart state */
+  if ((addr[0] == 0xE7) && (addr[1] == ref[0]) && (addr[2] == ref[1]) && (addr[3] == ref[2])) {
+    return true;
+  }
+
+  return false;
+}
+
+static void nrf905_channel(uint8_t channel)
+{
+  if (channel != nrf905_channel_prev) {
+
+    uint32_t frequency;
+    nRF905_band_t band;
+
+    frequency = RF_FreqPlan.getChanFrequency(channel);
+    band = (frequency >= 844800000UL ? NRF905_BAND_868 : NRF905_BAND_433);
+
+    nRF905_setFrequency(band , frequency);
+
+    nrf905_channel_prev = channel;
+    /* restart Rx upon a channel switch */
+    nrf905_receive_active = false;
+  }
+}
+
+static void nrf905_setup()
+{
+  SoC->SPI_begin();
+
+  // Start up
+  nRF905_init();
+
+  /* Channel selection is now part of RF_loop() */
+//  nrf905_channel(channel);
+
+  //nRF905_setTransmitPower(NRF905_PWR_10);
+  //nRF905_setTransmitPower(NRF905_PWR_n10);
+
+  switch(settings->txpower)
+  {
+  case RF_TX_POWER_FULL:
+
+    /*
+     * NRF905 is unable to give more than 10 dBm
+     * 10 dBm is legal everywhere in the world
+     */
+
+    nRF905_setTransmitPower((nRF905_pwr_t)NRF905_PWR_10);
+    break;
+  case RF_TX_POWER_OFF:
+  case RF_TX_POWER_LOW:
+  default:
+    nRF905_setTransmitPower((nRF905_pwr_t)NRF905_PWR_n10);
+    break;
+  }
+
+  nRF905_setCRC(NRF905_CRC_16);
+  //nRF905_setCRC(NRF905_CRC_DISABLE);
+
+  // Set address of this device
+  byte addr[] = RXADDR;
+  nRF905_setRXAddress(addr);
+
+  /* Enforce radio settings to follow "Legacy" protocol's RF specs */
+  if (settings->rf_protocol != RF_PROTOCOL_LATEST)
+      settings->rf_protocol = RF_PROTOCOL_LEGACY;
+
+  /* Enforce encoder and decoder to process "Legacy" frames only */
+  protocol_encode = &legacy_encode;
+  protocol_decode = &legacy_decode;
+
+  /* Put IC into receive mode */
+  nRF905_receive();
+}
+
+static bool nrf905_receive()
+{
+  bool success = false;
+
+  // Put into receive mode
+  if (!nrf905_receive_active) {
+    nRF905_receive();
+    nrf905_receive_active = true;
+  }
+
+  success = nRF905_getData(RxBuffer, LEGACY_PAYLOAD_SIZE);
+  if (success) { // Got data
+    rx_packets_counter++;
+  }
+
+  return success;
+}
+
+static void nrf905_transmit()
+{
+    nrf905_receive_active = false;
+
+    // Set address of device to send to
+    byte addr[] = TXADDR;
+    nRF905_setTXAddress(addr);
+
+    // Set payload data
+    nRF905_setData(&TxBuffer[0], LEGACY_PAYLOAD_SIZE );
+
+    // Send payload (send fails if other transmissions are going on, keep trying until success)
+    while (!nRF905_send()) {
+      yield();
+    } ;
+}
+
+static void nrf905_shutdown()
+{
+  nRF905_powerDown();
+  SPI.end();
+}
+
+#endif /* EXCLUDE_NRF905 */
+
+#if !defined(EXCLUDE_SX12XX)
+/*
+ * SX12XX-specific code
+ *
+ *
+ */
+
+osjob_t sx12xx_txjob;
+osjob_t sx12xx_timeoutjob;
+
+static void sx12xx_tx_func (osjob_t* job);
+static void sx12xx_rx_func (osjob_t* job);
+static void sx12xx_rx(osjobcb_t func);
+
+static bool sx12xx_receive_complete = false;
+bool sx12xx_receive_active = false;
+static bool sx12xx_transmit_complete = false;
+
+static uint8_t sx12xx_channel_prev = RF_CHANNEL_NONE;
+
+#if defined(USE_BASICMAC)
+void os_getDevEui (u1_t* buf) { }
+u1_t os_getRegion (void) { return REGCODE_EU868; }
+#else
+#if !defined(DISABLE_INVERT_IQ_ON_RX)
+#error This example requires DISABLE_INVERT_IQ_ON_RX to be set. Update \
+       config.h in the lmic library to set it.
+#endif
+#endif
+
+#define SX1276_RegVersion          0x42 // common
+
+static u1_t sx1276_readReg (u1_t addr) {
+#if defined(USE_BASICMAC)
+    hal_spi_select(1);
+#else
+    hal_pin_nss(0);
+#endif
+    hal_spi(addr & 0x7F);
+    u1_t val = hal_spi(0x00);
+#if defined(USE_BASICMAC)
+    hal_spi_select(0);
+#else
+    hal_pin_nss(1);
+#endif
+    return val;
+}
+
+static bool sx1276_probe()
+{
+  u1_t v, v_reset;
+
+  SoC->SPI_begin();
+
+  hal_init_softrf (nullptr);
+
+  // manually reset radio
+  hal_pin_rst(0); // drive RST pin low
+  hal_waitUntil(os_getTime()+ms2osticks(1)); // wait >100us
+
+  v_reset = sx1276_readReg(SX1276_RegVersion);
+
+  hal_pin_rst(2); // configure RST pin floating!
+  hal_waitUntil(os_getTime()+ms2osticks(5)); // wait 5ms
+
+  v = sx1276_readReg(SX1276_RegVersion);
+
+  pinMode(lmic_pins.nss, INPUT);
+  SPI.end();
+
+  if (v == 0x12 || v == 0x13) {
+
+    if (v_reset == 0x12 || v_reset == 0x13) {
+      RF_SX12XX_RST_is_connected = false;
+    }
+
+    return true;
+  } else {
+    return false;
+  }
+}
+
+#if defined(USE_BASICMAC)
+
+#define CMD_READREGISTER		        0x1D
+#define REG_LORASYNCWORDLSB	        0x0741
+#define SX126X_DEF_LORASYNCWORDLSB  0x24
+
+static void sx1262_ReadRegs (uint16_t addr, uint8_t* data, uint8_t len) {
+    hal_spi_select(1);
+    hal_pin_busy_wait();
+    hal_spi(CMD_READREGISTER);
+    hal_spi(addr >> 8);
+    hal_spi(addr);
+    hal_spi(0x00); // NOP
+    for (uint8_t i = 0; i < len; i++) {
+        data[i] = hal_spi(0x00);
+    }
+    hal_spi_select(0);
+}
+
+static uint8_t sx1262_ReadReg (uint16_t addr) {
+    uint8_t val;
+    sx1262_ReadRegs(addr, &val, 1);
+    return val;
+}
+
+static bool sx1262_probe()
+{
+  u1_t v, v_reset;
+
+  SoC->SPI_begin();
+
+  hal_init_softrf (nullptr);
+
+  // manually reset radio
+  hal_pin_rst(0); // drive RST pin low
+  hal_waitUntil(os_getTime()+ms2osticks(1)); // wait >100us
+
+  v_reset = sx1262_ReadReg(REG_LORASYNCWORDLSB);
+
+  hal_pin_rst(2); // configure RST pin floating!
+  hal_waitUntil(os_getTime()+ms2osticks(5)); // wait 5ms
+
+  v = sx1262_ReadReg(REG_LORASYNCWORDLSB);
+
+  pinMode(lmic_pins.nss, INPUT);
+  SPI.end();
+
+  u1_t fanet_sw_lsb = ((fanet_proto_desc.syncword[0]  & 0x0F) << 4) | 0x04;
+  if (v == SX126X_DEF_LORASYNCWORDLSB || v == fanet_sw_lsb) {
+
+    if (v_reset == SX126X_DEF_LORASYNCWORDLSB || v == fanet_sw_lsb) {
+      RF_SX12XX_RST_is_connected = false;
+    }
+
+    return true;
+  } else {
+    return false;
+  }
+}
+#endif
+
+static void sx12xx_channel(uint8_t channel)
+{
+  if (channel != sx12xx_channel_prev) {
+
+    uint32_t frequency = RF_FreqPlan.getChanFrequency(channel);
+
+    //Serial.print("frequency: "); Serial.println(frequency);
+
+    if (sx12xx_receive_active) {
+      os_radio(RADIO_RST);
+      sx12xx_receive_active = false;
+    }
+
+    /* correction of not more than 30 kHz is allowed */
+    int8_t fc = settings->freq_corr;
+    //if (rf_chip->type == RF_IC_SX1276) {
+      /* Most of SX1262 designs use TCXO */
+      // but allow frequency correction on it anyway
+    if (fc != 0) {
+      if (fc > 30) {
+        fc = 30;
+      } else if (fc < -30) {
+        fc = -30;
+      };
+      LMIC.freq = frequency + (fc * 1000);
+    } else {
+      LMIC.freq = frequency;
+    }
+    /* Actual RF chip's channel registers will be updated before each Tx or Rx session */
+
+    sx12xx_channel_prev = channel;
+
+//Serial.println("sx12xx_channel() set freq");
+//  } else {
+//Serial.println("sx12xx_channel() skipped setting freq");
+  }
+}
+
+static uint8_t sx12xx_txpower()
+{
+  uint8_t power = 2;   /* 2 dBm is minimum for RFM95W on PA_BOOST pin */
+
+  if (settings->txpower == RF_TX_POWER_FULL) {
+
+    /* Load regional max. EIRP at first */
+    power = RF_FreqPlan.MaxTxPower;
+
+    if (rf_chip->type == RF_IC_SX1262) {
+      /* SX1262 is unable to give more than 22 dBm */
+      //if (LMIC.txpow > 22)
+      //  LMIC.txpow = 22;
+      // The sx1262 has internal protection against antenna mismatch.
+      // And yet the T-Echo instructions warn against using without an antenna.
+      // But keep is a bit lower ayway
+      if (power > 19)
+          power = 19;
+    } else {
+      /* SX1276 is unable to give more than 20 dBm */
+      //if (LMIC.txpow > 20)
+      //  LMIC.txpow = 20;
+    // Most T-Beams have an sx1276, it can give 20 dBm but only safe with a good antenna.
+    // Note that the regional legal limit RF_FreqPlan.MaxTxPower also applies,
+    //   it is only 14 dBm in EU, but 30 in Americas, India & Australia.
+    //if (hw_info.model != SOFTRF_MODEL_PRIME_MK2) {
+        /*
+         * Enforce Tx power limit until confirmation
+         * that RFM95W is doing well
+         * when antenna is not connected
+         */
+        if (power > 17)
+            power = 17;
+    //}
+    }
+    if (settings->relay >= RELAY_ONLY)
+        power = 8;
+  }
+
+  return power;
+}
+
+static void set_lmic_protocol(uint8_t protocol)   // only used during RF_setup()
+{
+  switch (protocol)
+  {
+  case RF_PROTOCOL_ADSL:
+    LMIC.protocol = &adsl_proto_desc;
+    protocol_encode = &adsl_encode;
+    protocol_decode = &adsl_decode;
+    break;
+  case RF_PROTOCOL_OGNTP:
+    LMIC.protocol = &ogntp_proto_desc;
+    protocol_encode = &ogntp_encode;
+    protocol_decode = &ogntp_decode;
+    break;
+  case RF_PROTOCOL_P3I:
+    LMIC.protocol = &p3i_proto_desc;
+    protocol_encode = &p3i_encode;
+    protocol_decode = &p3i_decode;
+    break;
+  case RF_PROTOCOL_FANET:
+    LMIC.protocol = &fanet_proto_desc;
+    protocol_encode = &fanet_encode;
+    protocol_decode = &fanet_decode;
+    break;
+  case RF_PROTOCOL_LEGACY:
+    LMIC.protocol = &legacy_proto_desc;
+    protocol_encode = &legacy_encode;     // encodes both LEGACY and LATEST
+    protocol_decode = &legacy_decode;     // decodes both LEGACY and LATEST
+    break;
+  case RF_PROTOCOL_LATEST:
+  default:
+    LMIC.protocol = &latest_proto_desc;
+    protocol_encode = &legacy_encode;     // encodes both LEGACY and LATEST
+    protocol_decode = &legacy_decode;     // decodes both LEGACY and LATEST
+    break;
+  }
+}
+
+static void sx12xx_resetup()
+{
+  // initialize runtime env
+  os_init (nullptr);
+
+  // Reset the MAC state. Session and pending data transfers will be discarded.
+  // - this clears the LMIC structure, so need to save and restore the protocol.
+  const rf_proto_desc_t  *p = LMIC.protocol;
+  LMIC_reset();   // >>> or maybe just do:  os_radio(RADIO_RST)  - if that
+  delay(1);
+  LMIC.protocol = p;
+
+  sx12xx_channel_prev = RF_CHANNEL_NONE;
+       // force channel setting on next call - even if channel has not changed
+
+  LMIC.txpow = sx12xx_txpower();
+}
+
+static void sx12xx_setup()
+{
+  SoC->SPI_begin();
+
+  sx12xx_resetup();
+}
+
+static void sx12xx_setvars()
+{
+  if (LMIC.protocol && LMIC.protocol->modulation_type == RF_MODULATION_TYPE_LORA) {
+    LMIC.datarate = LMIC.protocol->bitrate;
+    LMIC.syncword = LMIC.protocol->syncword[0];
+  } else {
+    LMIC.datarate = DR_FSK;
+  }
+
+#if defined(USE_BASICMAC)
+
+#define updr2rps  LMIC_updr2rps
+
+  // LMIC.rps = MAKERPS(sf, BW250, CR_4_5, 0, 0);
+
+  LMIC.noRXIQinversion = true;
+  LMIC.rxsyms = 100;
+
+#endif /* USE_BASICMAC */
+
+  // This sets CR 4/5, BW125 (except for DR_SF7B, which uses BW250)
+  LMIC.rps = updr2rps(LMIC.datarate);
+
+
+  if (LMIC.protocol && LMIC.protocol->type == RF_PROTOCOL_FANET) {
+    /* for only a few nodes around, increase the coding rate to ensure a more robust transmission */
+    LMIC.rps = setCr(LMIC.rps, CR_4_8);
+  }
+}
+
+static bool sx12xx_receive()
+{
+  bool success = false;
+  sx12xx_receive_complete = false;
+
+  //LMIC.protocol = curr_rx_protocol_ptr;  done in set_protocol_for_slot
+
+  if (!sx12xx_receive_active) {  // reset by sx12xx_rx_func() or by sx12xx_channel()
+    if (settings->power_save & POWER_SAVE_NORECEIVE) {
+      LMIC_shutdown();
+    } else {
+#if 0
+      // redundant since already done in set_protocol_for_slot
+      if (rx_flr_adsl) {
+          LMIC.protocol = &flr_adsl_proto_desc;
+          protocol_decode = &flr_adsl_decode;
+      }
+#endif
+      sx12xx_setvars();
+      sx12xx_rx(sx12xx_rx_func);
+    }
+    sx12xx_receive_active = true;
+  }
+
+  if (sx12xx_receive_complete == false) {
+    // execute scheduled jobs and events
+    os_runstep();
+  };
+
+  if (sx12xx_receive_complete == true) {  // set by sx12xx_rx_func()
+    RF_last_rssi = LMIC.rssi;
+    rx_packets_counter++;
+    success = true;
+
+if (settings->debug_flags & DEBUG_DEEPER) {
+uint32_t ms = millis() - ref_time_ms;
+if (ms < 300)  ms += 1000;
+Serial.printf("RX in prot %d, time slot %d, sec %d(%d) + %d ms\r\n",
+    RF_last_protocol, RF_current_slot, RF_time, (RF_time & 0x0F), ms);
+}
+
+  }
+
+  return success;
+}
+
+static void sx12xx_transmit()
+{
+    sx12xx_transmit_complete = false;
+    sx12xx_receive_active = false;
+
+    sx12xx_setvars();
+    os_setCallback(&sx12xx_txjob, sx12xx_tx_func);
+
+    unsigned long tx_timeout = LMIC.protocol ? (LMIC.protocol->air_time + 25) : 60;
+    unsigned long tx_start   = millis();
+
+    while (sx12xx_transmit_complete == false) {
+
+      if ((millis() - tx_start) > tx_timeout) {   // timeout code from v1.2
+        os_radio(RADIO_RST);
+        Serial.println("TX timeout");
+        RF_tx_size = 0;
+        break;
+      }
+
+      // execute scheduled jobs and events
+      os_runstep();
+
+      yield();
+    };
+}
+
+static void sx1276_shutdown()
+{
+  LMIC_shutdown();
+
+  SPI.end();
+}
+
+#if defined(USE_BASICMAC)
+static void sx1262_shutdown()
+{
+  os_init (nullptr);
+  sx126x_ll_ops.radio_sleep();
+  delay(1);
+
+  SPI.end();
+}
+#endif /* USE_BASICMAC */
+
+// Enable rx mode and call func when a packet is received
+static void sx12xx_rx(osjobcb_t func) {
+  LMIC.osjob.func = func;
+  LMIC.rxtime = os_getTime(); // RX _now_
+  // Enable "continuous" RX for LoRa only (e.g. without a timeout,
+  // still stops after receiving a packet)
+if (LMIC.protocol==NULL)
+Serial.println("sx12xx_rx(): LMIC.protocol==NULL");
+  os_radio(LMIC.protocol &&
+           LMIC.protocol->modulation_type == RF_MODULATION_TYPE_LORA ?
+          RADIO_RXON : RADIO_RX);
+  //Serial.println("RX");
+}
+
+static void sx12xx_rx_func(osjob_t* job) {
+
+  u1_t crc8, pkt_crc8;
+  u2_t crc16, pkt_crc16;
+  u1_t i;
+
+//Serial.printf("sx12xx_rx_func() called, datalen=%d\r\n", LMIC.dataLen);
+
+  // SX1276 is in SLEEP after IRQ handler, Force it to enter RX mode
+  sx12xx_receive_active = false;
+
+  /* FANET (LoRa) LMIC IRQ handler may deliver empty packets here when CRC is invalid. */
+  if (LMIC.dataLen == 0) {
+    sx12xx_receive_complete = false;
+    return;
+  }
+
+  u1_t size = LMIC.dataLen;     // include the CRC bytes in the data copy/shift
+
+  unsigned crc_type = LMIC.protocol->crc_type;
+//  if (curr_rx_protocol_ptr == &flr_adsl_proto_desc)
+  if (rx_flr_adsl) {
+      // examine 2 later bytes in the sync word to identify the protocol
+      // - that was 4 bytes before Manchester decoding
+      if (LMIC.frame[0]==FLR_ID_BYTE_1 && LMIC.frame[1]==FLR_ID_BYTE_2) {
+          RF_last_protocol = RF_PROTOCOL_LATEST;
+          crc_type = RF_CHECKSUM_TYPE_CCITT_FFFF;
+      } else if (LMIC.frame[0]==ADSL_ID_BYTE_1 && LMIC.frame[1]==ADSL_ID_BYTE_2) {
+          RF_last_protocol = RF_PROTOCOL_ADSL;
+          crc_type = RF_CHECKSUM_TYPE_CRC_MODES;
+          size -= 2;        // packet 3 bytes shorter but CRC one byte longer than Legacy
+      } else {
+          RF_last_protocol = RF_PROTOCOL_NONE;
+          sx12xx_receive_complete = false;
+//Serial.printf("Unidentified packet protocol 0x%02x 0x%02x\r\n", LMIC.frame[0], LMIC.frame[1]);
+          return;
+      }
+  }
+
+  if (size > sizeof(RxBuffer))
+      size = sizeof(RxBuffer);
+
+//Serial.print("size=");
+//Serial.println(size);
+//Serial.println(Bin2Hex((byte *) LMIC.frame, size));
+
+  u1_t offset = LMIC.protocol->payload_offset;    // 0 for FLR & ADSL & OGNTP
+
+//  if (curr_rx_protocol_ptr == &flr_adsl_proto_desc)
+  if (rx_flr_adsl) {
+      // skip the unused sync bytes
+      size -= 3;
+      // shift the payload bits as needed
+      byte *p = &LMIC.frame[2];
+      byte *q = &LMIC.frame[3];
+      byte *r = &RxBuffer[0];
+      for (u1_t i=0; i < size; i++) {
+          *r++ = (*p << 7) | (*q >> 1);
+          ++p;
+          ++q;
+      }
+  } else {
+      // single protocol, no bit-shifting needed, just copy by bytes
+      size -= offset;
+      for (u1_t i=0; i < size; i++) {
+         RxBuffer[i] = LMIC.frame[offset+i];
+      }
+      RF_last_protocol = current_RX_protocol;
+  }
+
+//Serial.println(Bin2Hex((byte *) RxBuffer, size));
+
+  // now can compute and check the CRC
+
+  switch (crc_type)
+  {
+  case RF_CHECKSUM_TYPE_GALLAGER:
+  case RF_CHECKSUM_TYPE_CRC_MODES:
+  case RF_CHECKSUM_TYPE_NONE:
+     /* crc16 left not initialized */
+    break;
+  case RF_CHECKSUM_TYPE_CRC8_107:
+    crc8 = 0x71;     /* seed value */
+    break;
+  case RF_CHECKSUM_TYPE_CCITT_0000:
+    crc16 = 0x0000;  /* seed value */
+    break;
+  case RF_CHECKSUM_TYPE_CCITT_FFFF:    // includes FLR packet in FLR_ADSL dual mode
+  default:
+    crc16 = 0xffff;  /* seed value */
+    break;
+  }
+
+  if (crc_type != RF_CHECKSUM_TYPE_CRC_MODES) {  // not ADS-L packet
+
+    switch (LMIC.protocol->type)
+    {
+    case RF_PROTOCOL_LEGACY:    // includes FLR_ADSL dual mode
+    case RF_PROTOCOL_LATEST:
+      /* take in account NRF905/FLARM "address" bytes */
+      crc16 = update_crc_ccitt(crc16, 0x31);
+      crc16 = update_crc_ccitt(crc16, 0xFA);
+      crc16 = update_crc_ccitt(crc16, 0xB6);
+      break;
+    case RF_PROTOCOL_P3I:
+    case RF_PROTOCOL_OGNTP:
+    case RF_PROTOCOL_ADSL:
+    default:
+      break;
+    }
+
+
+    for (i = 0; i < size - LMIC.protocol->crc_size; i++)
+    {
+
+      switch (crc_type)
+      {
+      case RF_CHECKSUM_TYPE_GALLAGER:
+      case RF_CHECKSUM_TYPE_CRC_MODES:
+      case RF_CHECKSUM_TYPE_NONE:
+        break;
+      case RF_CHECKSUM_TYPE_CRC8_107:
+        update_crc8(&crc8, (u1_t)(RxBuffer[i]));
+        break;
+      case RF_CHECKSUM_TYPE_CCITT_FFFF:    // includes FLR packet in FLR_ADSL dual mode
+      case RF_CHECKSUM_TYPE_CCITT_0000:
+      default:
+        crc16 = update_crc_ccitt(crc16, (u1_t)(RxBuffer[i]));
+        break;
+      }
+
+      switch (LMIC.protocol->whitening)
+      {
+      case RF_WHITENING_NICERF:
+        RxBuffer[i] ^= pgm_read_byte(&whitening_pattern[i]);
+        break;
+      case RF_WHITENING_MANCHESTER:
+      case RF_WHITENING_NONE:
+      default:
+        break;
+      }
+
+    }
+
+  }
+
+  switch (crc_type)
+  {
+  case RF_CHECKSUM_TYPE_NONE:
+    sx12xx_receive_complete = true;
+    break;
+  case RF_CHECKSUM_TYPE_GALLAGER:
+    if (LDPC_Check((uint8_t  *) RxBuffer)) {
+      sx12xx_receive_complete = false;
+    } else {
+      sx12xx_receive_complete = true;
+    }
+    break;
+  case RF_CHECKSUM_TYPE_CRC_MODES:    // includes ADSL packet in FLR_ADSL dual mode
+    if (ADSL_Packet::checkPI((uint8_t  *) RxBuffer, size)) {
+      sx12xx_receive_complete = false;
+Serial.println("ADS-L CRC wrong");
+    } else {
+      RF_last_crc = (RxBuffer[size-3] << 16 | RxBuffer[size-2] << 8 | RxBuffer[size-1]);
+      sx12xx_receive_complete = true;
+    }
+    break;
+  case RF_CHECKSUM_TYPE_CRC8_107:
+    pkt_crc8 = RxBuffer[i];
+    if (crc8 == pkt_crc8) {
+      RF_last_crc = crc8;
+      sx12xx_receive_complete = true;
+    } else {
+      sx12xx_receive_complete = false;
+    }
+    break;
+  case RF_CHECKSUM_TYPE_CCITT_FFFF:    // includes FLR packet in FLR_ADSL dual mode
+  case RF_CHECKSUM_TYPE_CCITT_0000:
+  default:
+    pkt_crc16 = (RxBuffer[size-2] << 8 | RxBuffer[size-1]);
+    if (crc16 == pkt_crc16) {
+      RF_last_crc = crc16;
+      sx12xx_receive_complete = true;
+    } else {
+      sx12xx_receive_complete = false;
+Serial.println("FLR CRC wrong");
+    }
+    break;
+  }
+
+/*
+if (sx12xx_receive_complete && settings->debug_flags) {
+uint8_t protocol = LMIC.protocol->type;
+if (rx_flr_adsl)  protocol = RF_last_protocol;
+Serial.printf("RX in prot %d, time slot %d, sec %d(%d) + %d ms\r\n",
+    protocol, RF_current_slot, RF_time, (RF_time & 0x0F), millis()-ref_time_ms);
+}
+*/
+
+}
+
+// Transmit the given string and call the given function afterwards
+static void sx12xx_tx(unsigned char *buf, size_t size, osjobcb_t func) {
+
+  u1_t crc8;
+  u2_t crc16;
+
+  switch (LMIC.protocol->crc_type)
+  {
+  case RF_CHECKSUM_TYPE_GALLAGER:
+  case RF_CHECKSUM_TYPE_NONE:
+     /* crc16 left not initialized */
+    break;
+  case RF_CHECKSUM_TYPE_CRC8_107:
+    crc8 = 0x71;     /* seed value */
+    break;
+  case RF_CHECKSUM_TYPE_CCITT_0000:
+    crc16 = 0x0000;  /* seed value */
+    break;
+  case RF_CHECKSUM_TYPE_CCITT_FFFF:
+  default:
+    crc16 = 0xffff;  /* seed value */
+    break;
+  }
+  
+  os_radio(RADIO_RST); // Stop RX first
+  delay(1); // Wait a bit, without this os_radio below asserts, apparently because the state hasn't changed yet
+
+  LMIC.dataLen = 0;
+
+  switch (LMIC.protocol->type)
+  {
+  case RF_PROTOCOL_LEGACY:
+  case RF_PROTOCOL_LATEST:
+    /* take in account NRF905/FLARM "address" bytes */
+    crc16 = update_crc_ccitt(crc16, 0x31);
+    crc16 = update_crc_ccitt(crc16, 0xFA);
+    crc16 = update_crc_ccitt(crc16, 0xB6);
+    break;
+  case RF_PROTOCOL_P3I:
+    /* insert Net ID */
+    LMIC.frame[LMIC.dataLen++] = (u1_t) ((LMIC.protocol->net_id >> 24) & 0x000000FF);
+    LMIC.frame[LMIC.dataLen++] = (u1_t) ((LMIC.protocol->net_id >> 16) & 0x000000FF);
+    LMIC.frame[LMIC.dataLen++] = (u1_t) ((LMIC.protocol->net_id >>  8) & 0x000000FF);
+    LMIC.frame[LMIC.dataLen++] = (u1_t) ((LMIC.protocol->net_id >>  0) & 0x000000FF);
+    /* insert byte with payload size */
+    LMIC.frame[LMIC.dataLen++] = LMIC.protocol->payload_size;
+
+    /* insert byte with CRC-8 seed value when necessary */
+    if (LMIC.protocol->crc_type == RF_CHECKSUM_TYPE_CRC8_107) {
+      LMIC.frame[LMIC.dataLen++] = crc8;
+    }
+
+    break;
+  case RF_PROTOCOL_OGNTP:
+  case RF_PROTOCOL_ADSL:
+  default:
+    break;
+  }
+
+  for (u1_t i=0; i < size; i++) {
+
+    switch (LMIC.protocol->whitening)
+    {
+    case RF_WHITENING_NICERF:
+      LMIC.frame[LMIC.dataLen] = buf[i] ^ pgm_read_byte(&whitening_pattern[i]);
+      break;
+    case RF_WHITENING_MANCHESTER:
+    case RF_WHITENING_NONE:
+    default:
+      LMIC.frame[LMIC.dataLen] = buf[i];
+      break;
+    }
+
+    switch (LMIC.protocol->crc_type)
+    {
+    case RF_CHECKSUM_TYPE_GALLAGER:
+    case RF_CHECKSUM_TYPE_CRC_MODES:
+    case RF_CHECKSUM_TYPE_NONE:
+      break;
+    case RF_CHECKSUM_TYPE_CRC8_107:
+      update_crc8(&crc8, (u1_t)(LMIC.frame[LMIC.dataLen]));
+      break;
+    case RF_CHECKSUM_TYPE_CCITT_FFFF:
+    case RF_CHECKSUM_TYPE_CCITT_0000:
+    default:
+      crc16 = update_crc_ccitt(crc16, (u1_t)(LMIC.frame[LMIC.dataLen]));
+      break;
+    }
+
+    LMIC.dataLen++;
+  }
+
+  switch (LMIC.protocol->crc_type)
+  {
+  case RF_CHECKSUM_TYPE_GALLAGER:
+  case RF_CHECKSUM_TYPE_CRC_MODES:
+  case RF_CHECKSUM_TYPE_NONE:
+    break;
+  case RF_CHECKSUM_TYPE_CRC8_107:
+    LMIC.frame[LMIC.dataLen++] = crc8;
+    break;
+  case RF_CHECKSUM_TYPE_CCITT_FFFF:
+  case RF_CHECKSUM_TYPE_CCITT_0000:
+  default:
+    LMIC.frame[LMIC.dataLen++] = (crc16 >>  8) & 0xFF;
+    LMIC.frame[LMIC.dataLen++] = (crc16      ) & 0xFF;
+    break;
+  }
+
+if (LMIC.protocol==NULL)
+Serial.println("sx12xx_tx(): LMIC.protocol==NULL");
+
+  LMIC.osjob.func = func;
+  os_radio(RADIO_TX);
+  //Serial.println("TX");
+}
+
+static void sx12xx_txdone_func (osjob_t* job) {
+  sx12xx_transmit_complete = true;
+}
+
+static void sx12xx_tx_func (osjob_t* job) {
+
+  if (RF_tx_size > 0) {
+    sx12xx_tx((unsigned char *) &TxBuffer[0], RF_tx_size, sx12xx_txdone_func);
+  }
+}
+#endif /* EXCLUDE_SX12XX */
+
+#if !defined(EXCLUDE_UATM)
+/*
+ * UATM-specific code
+ *
+ *
+ */
+
+#include <uat.h>
+
+#define UAT_RINGBUF_SIZE  (sizeof(Stratux_frame_t) * 2)
+
+static unsigned char uat_ringbuf[UAT_RINGBUF_SIZE];
+static unsigned int uatbuf_head = 0;
+Stratux_frame_t uatradio_frame;
+
+const char UAT_ident[] PROGMEM = SOFTRF_IDENT;
+
+static bool uatm_probe()
+{
+  bool success = false;
+  uint32_t startTime;
+  unsigned int uatbuf_tail;
+  u1_t keylen = strlen_P(UAT_ident);
+  u1_t i=0;
+
+  /* Do not probe on itself and ESP8266 */
+  if (SoC->id == SOC_CC13X0 ||
+      SoC->id == SOC_CC13X2 ||
+      SoC->id == SOC_ESP8266) {
+    return success;
+  }
+
+  SoC->UATSerial_begin(UAT_RECEIVER_BR);
+
+  SoC->UATModule_restart();
+
+  startTime = millis();
+
+  // Timeout if no valid response in 1 second
+  while (millis() - startTime < 1000) {
+
+    if (UATSerial.available() > 0) {
+      unsigned char c = UATSerial.read();
+#if DEBUG
+      Serial.println(c, HEX);
+#endif
+      uat_ringbuf[uatbuf_head % UAT_RINGBUF_SIZE] = c;
+
+      uatbuf_tail = uatbuf_head - keylen;
+      uatbuf_head++;
+
+      for (i=0; i < keylen; i++) {
+        if (pgm_read_byte(&UAT_ident[i]) != uat_ringbuf[(uatbuf_tail + i) % UAT_RINGBUF_SIZE]) {
+          break;
+        }
+      }
+
+      if (i >= keylen) {
+        success = true;
+        break;
+      }
+    }
+  }
+
+  /* cleanup UAT data buffer */
+  uatbuf_head = 0;
+  memset(uat_ringbuf, 0, sizeof(uat_ringbuf));
+
+  /* Current ESP32 Core has a bug with Serial2.end()+Serial2.begin() cycle */
+  if (SoC->id != SOC_ESP32) {
+    UATSerial.end();
+  }
+
+  return success;
+}
+
+static void uatm_channel(uint8_t channel)
+{
+  /* Nothing to do */
+}
+
+static void uatm_setup()
+{
+  /* Current ESP32 Core has a bug with Serial2.end()+Serial2.begin() cycle */
+  if (SoC->id != SOC_ESP32) {
+    SoC->UATSerial_begin(UAT_RECEIVER_BR);
+  }
+
+  init_fec();
+
+  /* Enforce radio settings to follow UAT978 protocol's RF specs */
+  settings->rf_protocol = RF_PROTOCOL_ADSB_UAT;
+
+  protocol_encode = &uat978_encode;
+  protocol_decode = &uat978_decode;
+
+}
+
+static bool uatm_receive()
+{
+  bool success = false;
+  unsigned int uatbuf_tail;
+  int rs_errors;
+
+  while (UATSerial.available()) {
+    unsigned char c = UATSerial.read();
+
+    uat_ringbuf[uatbuf_head % UAT_RINGBUF_SIZE] = c;
+
+    uatbuf_tail = uatbuf_head - sizeof(Stratux_frame_t);
+    uatbuf_head++;
+
+    if (uat_ringbuf[ uatbuf_tail      % UAT_RINGBUF_SIZE] == STRATUX_UATRADIO_MAGIC_1 &&
+        uat_ringbuf[(uatbuf_tail + 1) % UAT_RINGBUF_SIZE] == STRATUX_UATRADIO_MAGIC_2 &&
+        uat_ringbuf[(uatbuf_tail + 2) % UAT_RINGBUF_SIZE] == STRATUX_UATRADIO_MAGIC_3 &&
+        uat_ringbuf[(uatbuf_tail + 3) % UAT_RINGBUF_SIZE] == STRATUX_UATRADIO_MAGIC_4) {
+
+      unsigned char *pre_fec_buf = (unsigned char *) &uatradio_frame;
+      for (u1_t i=0; i < sizeof(Stratux_frame_t); i++) {
+          pre_fec_buf[i] = uat_ringbuf[(uatbuf_tail + i) % UAT_RINGBUF_SIZE];
+      }
+
+      int frame_type = correct_adsb_frame(uatradio_frame.data, &rs_errors);
+
+      if (frame_type == -1) {
+        continue;
+      }
+
+      u1_t size = 0;
+
+      if (frame_type == 1) {
+        size = SHORT_FRAME_DATA_BYTES;
+      } else if (frame_type == 2) {
+        size = LONG_FRAME_DATA_BYTES;
+      }
+
+      if (size > sizeof(RxBuffer)) {
+        size = sizeof(RxBuffer);
+      }
+
+      if (size > 0) {
+        memcpy(RxBuffer, uatradio_frame.data, size);
+
+        RF_last_rssi = uatradio_frame.rssi;
+        rx_packets_counter++;
+        success = true;
+
+        break;
+      }
+    }
+  }
+
+  return success;
+}
+
+static void uatm_transmit()
+{
+  /* Nothing to do */
+}
+
+static void uatm_shutdown()
+{
+  /* Nothing to do */
+}
+#endif /* EXCLUDE_UATM */
+
+#if !defined(EXCLUDE_CC13XX)
+/*
+ * CC13XX-specific code
+ *
+ *
+ */
+
+#include "EasyLink.h"
+
+#include <uat.h>
+#include <fec/char.h>
+#include <fec.h>
+#include <uat_decode.h>
+#include <manchester.h>
+
+#define MAX_SYNCWORD_SIZE       4
+
+const rf_proto_desc_t  *cc13xx_protocol = &uat978_proto_desc;
+
+EasyLink myLink;
+#if !defined(EXCLUDE_OGLEP3)
+EasyLink_TxPacket txPacket;
+#endif /* EXCLUDE_OGLEP3 */
+
+static uint8_t cc13xx_channel_prev = RF_CHANNEL_NONE;
+
+static bool cc13xx_receive_complete  = false;
+static bool cc13xx_receive_active    = false;
+static bool cc13xx_transmit_complete = false;
+
+void cc13xx_Receive_callback(EasyLink_RxPacket *rxPacket_ptr, EasyLink_Status status)
+{
+  cc13xx_receive_active = false;
+  bool success = false;
+
+  if (status == EasyLink_Status_Success) {
+
+    size_t size = 0;
+    uint8_t offset;
+
+    u1_t crc8, pkt_crc8;
+    u2_t crc16, pkt_crc16;
+
+#if !defined(EXCLUDE_OGLEP3)
+    switch (cc13xx_protocol->crc_type)
+    {
+    case RF_CHECKSUM_TYPE_GALLAGER:
+    case RF_CHECKSUM_TYPE_NONE:
+       /* crc16 left not initialized */
+      break;
+    case RF_CHECKSUM_TYPE_CRC8_107:
+      crc8 = 0x71;     /* seed value */
+      break;
+    case RF_CHECKSUM_TYPE_CCITT_0000:
+      crc16 = 0x0000;  /* seed value */
+      break;
+    case RF_CHECKSUM_TYPE_CCITT_FFFF:
+    default:
+      crc16 = 0xffff;  /* seed value */
+      break;
+    }
+
+    switch (cc13xx_protocol->type)
+    {
+    case RF_PROTOCOL_LEGACY:
+    case RF_PROTOCOL_LATEST:
+      /* take in account NRF905/FLARM "address" bytes */
+      crc16 = update_crc_ccitt(crc16, 0x31);
+      crc16 = update_crc_ccitt(crc16, 0xFA);
+      crc16 = update_crc_ccitt(crc16, 0xB6);
+      break;
+    case RF_PROTOCOL_P3I:
+    case RF_PROTOCOL_OGNTP:
+    case RF_PROTOCOL_ADSL:
+    default:
+      break;
+    }
+#endif /* EXCLUDE_OGLEP3 */
+
+    switch (cc13xx_protocol->type)
+    {
+#if !defined(EXCLUDE_OGLEP3)
+    case RF_PROTOCOL_P3I:
+      uint8_t i;
+      offset = cc13xx_protocol->payload_offset;
+      for (i = 0; i < cc13xx_protocol->payload_size; i++)
+      {
+        update_crc8(&crc8, (u1_t)(rxPacket_ptr->payload[i + offset]));
+        if (i < sizeof(RxBuffer)) {
+          RxBuffer[i] = rxPacket_ptr->payload[i + offset] ^
+                        pgm_read_byte(&whitening_pattern[i]);
+        }
+      }
+
+      pkt_crc8 = rxPacket_ptr->payload[i + offset];
+
+      if (crc8 == pkt_crc8) {
+
+        success = true;
+      }
+      break;
+    case RF_PROTOCOL_LATEST:
+    case RF_PROTOCOL_LEGACY:
+    case RF_PROTOCOL_OGNTP:
+    case RF_PROTOCOL_ADSL:
+      offset = cc13xx_protocol->syncword_size - 4;
+      size =  cc13xx_protocol->payload_offset +
+              cc13xx_protocol->payload_size +
+              cc13xx_protocol->payload_size +
+              cc13xx_protocol->crc_size +
+              cc13xx_protocol->crc_size;
+      if (rxPacket_ptr->len >= size + offset &&
+          rxPacket_ptr->payload[0] == cc13xx_protocol->syncword[4] &&
+          rxPacket_ptr->payload[1] == cc13xx_protocol->syncword[5] &&
+          rxPacket_ptr->payload[2] == cc13xx_protocol->syncword[6] &&
+          (offset > 3 ? (rxPacket_ptr->payload[3] == cc13xx_protocol->syncword[7]) : true)) {
+
+        uint8_t i, val1, val2;
+        for (i = 0; i < size; i++) {
+          val1 = pgm_read_byte(&ManchesterDecode[rxPacket_ptr->payload[i + offset]]);
+          i++;
+          val2 = pgm_read_byte(&ManchesterDecode[rxPacket_ptr->payload[i + offset]]);
+          if ((i>>1) < sizeof(RxBuffer)) {
+            RxBuffer[i>>1] = ((val1 & 0x0F) << 4) | (val2 & 0x0F);
+
+            if (i < size - (cc13xx_protocol->crc_size + cc13xx_protocol->crc_size)) {
+              switch (cc13xx_protocol->crc_type)
+              {
+              case RF_CHECKSUM_TYPE_GALLAGER:
+              case RF_CHECKSUM_TYPE_CRC_MODES:
+              case RF_CHECKSUM_TYPE_NONE:
+                break;
+              case RF_CHECKSUM_TYPE_CCITT_FFFF:
+              case RF_CHECKSUM_TYPE_CCITT_0000:
+              default:
+                crc16 = update_crc_ccitt(crc16, (u1_t)(RxBuffer[i>>1]));
+                break;
+              }
+            }
+          }
+        }
+
+        switch (cc13xx_protocol->crc_type)
+        {
+        case RF_CHECKSUM_TYPE_GALLAGER:
+          if (LDPC_Check((uint8_t  *) &RxBuffer[0]) == 0) {
+
+            success = true;
+          }
+          break;
+        case RF_CHECKSUM_TYPE_CCITT_FFFF:
+        case RF_CHECKSUM_TYPE_CCITT_0000:
+          offset = cc13xx_protocol->payload_offset + cc13xx_protocol->payload_size;
+          if (offset + 1 < sizeof(RxBuffer)) {
+            pkt_crc16 = (RxBuffer[offset] << 8 | RxBuffer[offset+1]);
+            if (crc16 == pkt_crc16) {
+              RF_last_crc = crc16;
+              success = true;
+            }
+          }
+          break;
+        default:
+          break;
+        }
+      }
+      break;
+#endif /* EXCLUDE_OGLEP3 */
+    case RF_PROTOCOL_ADSB_UAT:
+    default:
+      int rs_errors;
+      int frame_type;
+      frame_type = correct_adsb_frame(rxPacket_ptr->payload, &rs_errors);
+
+      if (frame_type != -1) {
+
+        if (frame_type == 1) {
+          size = SHORT_FRAME_DATA_BYTES;
+        } else if (frame_type == 2) {
+          size = LONG_FRAME_DATA_BYTES;
+        }
+
+        if (size > sizeof(RxBuffer)) {
+          size = sizeof(RxBuffer);
+        }
+
+        if (size > 0) {
+          memcpy(RxBuffer, rxPacket_ptr->payload, size);
+
+          success = true;
+        }
+      }
+      break;
+    }
+
+    if (success) {
+      RF_last_rssi = rxPacket_ptr->rssi;
+      rx_packets_counter++;
+
+      cc13xx_receive_complete  = true;
+    }
+  }
+}
+
+void cc13xx_Transmit_callback(EasyLink_Status status)
+{
+  if (status == EasyLink_Status_Success) {
+    cc13xx_transmit_complete = true;
+  }
+}
+
+static bool cc13xx_Receive_Async()
+{
+  bool success = false;
+  EasyLink_Status status;
+
+  if (!cc13xx_receive_active) {
+    status = myLink.receive(&cc13xx_Receive_callback);
+
+    if (status == EasyLink_Status_Success) {
+      cc13xx_receive_active = true;
+    }
+  }
+
+  if (cc13xx_receive_complete == true) {
+    success = true;
+    cc13xx_receive_complete = false;
+  }
+
+  return success;
+}
+
+static bool cc13xx_probe()
+{
+  bool success = false;
+
+  if (SoC->id == SOC_CC13X0 || SoC->id == SOC_CC13X2) {
+    success = true;
+  }
+
+  return success;
+}
+
+static void cc13xx_channel(uint8_t channel)
+{
+#if !defined(EXCLUDE_OGLEP3)
+  if (settings->rf_protocol != RF_PROTOCOL_ADSB_UAT &&
+      channel != cc13xx_channel_prev) {
+    uint32_t frequency = RF_FreqPlan.getChanFrequency(channel);
+
+    if (cc13xx_receive_active) {
+      /* restart Rx upon a channel switch */
+      EasyLink_abort();
+      cc13xx_receive_active = false;
+    }
+
+    EasyLink_setFrequency(frequency);
+
+    cc13xx_channel_prev = channel;
+  }
+#endif /* EXCLUDE_OGLEP3 */
+}
+
+static void cc13xx_setup()
+{
+  switch (settings->rf_protocol)
+  {
+#if !defined(EXCLUDE_OGLEP3)
+  case RF_PROTOCOL_ADSL:
+    cc13xx_protocol = &adsl_proto_desc;
+    protocol_encode = &adsl_encode;
+    protocol_decode = &adsl_decode;
+
+    myLink.begin(EasyLink_Phy_100kbps2gfsk_ogntp);         // <<< needs work
+    break;
+  case RF_PROTOCOL_OGNTP:
+    cc13xx_protocol = &ogntp_proto_desc;
+    protocol_encode = &ogntp_encode;
+    protocol_decode = &ogntp_decode;
+
+    myLink.begin(EasyLink_Phy_100kbps2gfsk_ogntp);
+    break;
+  case RF_PROTOCOL_P3I:
+    cc13xx_protocol = &p3i_proto_desc;
+    protocol_encode = &p3i_encode;
+    protocol_decode = &p3i_decode;
+
+    myLink.begin(EasyLink_Phy_38400bps2gfsk_p3i);
+    break;
+  case RF_PROTOCOL_LEGACY:
+    cc13xx_protocol = &legacy_proto_desc;
+    protocol_encode = &legacy_encode;
+    protocol_decode = &legacy_decode;
+
+    myLink.begin(EasyLink_Phy_100kbps2gfsk_legacy);
+    break;
+  case RF_PROTOCOL_LATEST:
+    cc13xx_protocol = &latest_proto_desc;
+    protocol_encode = &legacy_encode;
+    protocol_decode = &legacy_decode;
+
+    myLink.begin(EasyLink_Phy_100kbps2gfsk_legacy);
+    break;
+#endif /* EXCLUDE_OGLEP3 */
+  case RF_PROTOCOL_ADSB_UAT:
+  default:
+    cc13xx_protocol = &uat978_proto_desc;
+    protocol_encode = &uat978_encode;
+    protocol_decode = &uat978_decode;
+    /*
+     * Enforce UAT protocol setting
+     * if other value (FANET) left in EEPROM from other (SX12XX) radio
+     */
+    settings->rf_protocol = RF_PROTOCOL_ADSB_UAT;
+
+    init_fec();
+    myLink.begin(EasyLink_Phy_Custom);
+    break;
+  }
+
+  /* -10 dBm is a minumum for CC1310 ; CC1352 can operate down to -20 dBm */
+  int8_t TxPower = -10;
+
+  switch(settings->txpower)
+  {
+  case RF_TX_POWER_FULL:
+
+    if (settings->rf_protocol != RF_PROTOCOL_ADSB_UAT) {
+      /* Load regional max. EIRP at first */
+      TxPower = RF_FreqPlan.MaxTxPower;
+    }
+
+    if (TxPower > 14)
+      TxPower = 14; /* 'high power' CC13XXP (up to 20 dBm) is not supported yet */
+
+    break;
+  case RF_TX_POWER_OFF:
+  case RF_TX_POWER_LOW:
+  default:
+    break;
+  }
+
+  EasyLink_setRfPwr(TxPower);
+}
+
+static bool cc13xx_receive()
+{
+  return cc13xx_Receive_Async();
+}
+
+static void cc13xx_transmit()
+{
+#if !defined(EXCLUDE_OGLEP3)
+  EasyLink_Status status;
+
+  u1_t crc8;
+  u2_t crc16;
+  u1_t i;
+
+  if (RF_tx_size == 0) {
+    return;
+  }
+
+  if (cc13xx_protocol->type == RF_PROTOCOL_ADSB_UAT) {
+    return; /* no transmit on UAT */
+  }
+
+  EasyLink_abort();
+
+  cc13xx_receive_active = false;
+  cc13xx_transmit_complete = false;
+
+  size_t PayloadLen = 0;
+
+  switch (cc13xx_protocol->crc_type)
+  {
+  case RF_CHECKSUM_TYPE_GALLAGER:
+  case RF_CHECKSUM_TYPE_NONE:
+     /* crc16 left not initialized */
+    break;
+  case RF_CHECKSUM_TYPE_CRC8_107:
+    crc8 = 0x71;     /* seed value */
+    break;
+  case RF_CHECKSUM_TYPE_CCITT_0000:
+    crc16 = 0x0000;  /* seed value */
+    break;
+  case RF_CHECKSUM_TYPE_CCITT_FFFF:
+  default:
+    crc16 = 0xffff;  /* seed value */
+    break;
+  }
+
+  for (i = MAX_SYNCWORD_SIZE; i < cc13xx_protocol->syncword_size; i++)
+  {
+    txPacket.payload[PayloadLen++] = cc13xx_protocol->syncword[i];
+  }
+
+  switch (cc13xx_protocol->type)
+  {
+  case RF_PROTOCOL_LEGACY:
+  case RF_PROTOCOL_LATEST:
+    /* take in account NRF905/FLARM "address" bytes */
+    crc16 = update_crc_ccitt(crc16, 0x31);
+    crc16 = update_crc_ccitt(crc16, 0xFA);
+    crc16 = update_crc_ccitt(crc16, 0xB6);
+    break;
+  case RF_PROTOCOL_P3I:
+    /* insert Net ID */
+    txPacket.payload[PayloadLen++] = (u1_t) ((cc13xx_protocol->net_id >> 24) & 0x000000FF);
+    txPacket.payload[PayloadLen++] = (u1_t) ((cc13xx_protocol->net_id >> 16) & 0x000000FF);
+    txPacket.payload[PayloadLen++] = (u1_t) ((cc13xx_protocol->net_id >>  8) & 0x000000FF);
+    txPacket.payload[PayloadLen++] = (u1_t) ((cc13xx_protocol->net_id >>  0) & 0x000000FF);
+    /* insert byte with payload size */
+    txPacket.payload[PayloadLen++] = cc13xx_protocol->payload_size;
+
+    /* insert byte with CRC-8 seed value when necessary */
+    if (cc13xx_protocol->crc_type == RF_CHECKSUM_TYPE_CRC8_107) {
+      txPacket.payload[PayloadLen++] = crc8;
+    }
+
+    break;
+  case RF_PROTOCOL_OGNTP:
+  case RF_PROTOCOL_ADSL:
+  default:
+    break;
+  }
+
+  for (i=0; i < RF_tx_size; i++) {
+
+    switch (cc13xx_protocol->whitening)
+    {
+    case RF_WHITENING_NICERF:
+      txPacket.payload[PayloadLen] = TxBuffer[i] ^ pgm_read_byte(&whitening_pattern[i]);
+      break;
+    case RF_WHITENING_MANCHESTER:
+      txPacket.payload[PayloadLen] = pgm_read_byte(&ManchesterEncode[(TxBuffer[i] >> 4) & 0x0F]);
+      PayloadLen++;
+      txPacket.payload[PayloadLen] = pgm_read_byte(&ManchesterEncode[(TxBuffer[i]     ) & 0x0F]);
+      break;
+    case RF_WHITENING_NONE:
+    default:
+      txPacket.payload[PayloadLen] = TxBuffer[i];
+      break;
+    }
+
+    switch (cc13xx_protocol->crc_type)
+    {
+    case RF_CHECKSUM_TYPE_GALLAGER:
+    case RF_CHECKSUM_TYPE_NONE:
+      break;
+    case RF_CHECKSUM_TYPE_CRC8_107:
+      update_crc8(&crc8, (u1_t)(txPacket.payload[PayloadLen]));
+      break;
+    case RF_CHECKSUM_TYPE_CCITT_FFFF:
+    case RF_CHECKSUM_TYPE_CCITT_0000:
+    default:
+      if (cc13xx_protocol->whitening == RF_WHITENING_MANCHESTER) {
+        crc16 = update_crc_ccitt(crc16, (u1_t)(TxBuffer[i]));
+      } else {
+        crc16 = update_crc_ccitt(crc16, (u1_t)(txPacket.payload[PayloadLen]));
+      }
+      break;
+    }
+
+    PayloadLen++;
+  }
+
+  switch (cc13xx_protocol->crc_type)
+  {
+  case RF_CHECKSUM_TYPE_GALLAGER:
+  case RF_CHECKSUM_TYPE_NONE:
+    break;
+  case RF_CHECKSUM_TYPE_CRC8_107:
+    txPacket.payload[PayloadLen++] = crc8;
+    break;
+  case RF_CHECKSUM_TYPE_CCITT_FFFF:
+  case RF_CHECKSUM_TYPE_CCITT_0000:
+  default:
+    if (cc13xx_protocol->whitening == RF_WHITENING_MANCHESTER) {
+      txPacket.payload[PayloadLen++] = pgm_read_byte(&ManchesterEncode[(((crc16 >>  8) & 0xFF) >> 4) & 0x0F]);
+      txPacket.payload[PayloadLen++] = pgm_read_byte(&ManchesterEncode[(((crc16 >>  8) & 0xFF)     ) & 0x0F]);
+      txPacket.payload[PayloadLen++] = pgm_read_byte(&ManchesterEncode[(((crc16      ) & 0xFF) >> 4) & 0x0F]);
+      txPacket.payload[PayloadLen++] = pgm_read_byte(&ManchesterEncode[(((crc16      ) & 0xFF)     ) & 0x0F]);
+      PayloadLen++;
+    } else {
+      txPacket.payload[PayloadLen++] = (crc16 >>  8) & 0xFF;
+      txPacket.payload[PayloadLen++] = (crc16      ) & 0xFF;
+    }
+    break;
+  }
+
+  txPacket.len = PayloadLen;
+  // Transmit immediately
+  txPacket.absTime = EasyLink_ms_To_RadioTime(0);
+
+#if 0
+  status = myLink.transmit(&txPacket, &cc13xx_Transmit_callback);
+
+  if (status == EasyLink_Status_Success) {
+    while (cc13xx_transmit_complete == false) {
+      yield();
+    };
+  }
+#else
+  myLink.transmit(&txPacket);
+#endif
+
+#endif /* EXCLUDE_OGLEP3 */
+}
+
+static void cc13xx_shutdown()
+{
+  EasyLink_abort();
+}
+#endif /* EXCLUDE_CC13XX */
+
+#if defined(USE_OGN_RF_DRIVER)
+/*
+ * OGN driver specific code
+ *
+ *
+ */
+
+static RFM_TRX  TRX;
+
+static uint8_t ognrf_channel_prev  = RF_CHANNEL_NONE;
+static bool ognrf_receive_active   = false;
+
+void RFM_Select  (void)                 { hal_pin_nss(0); }
+void RFM_Deselect(void)                 { hal_pin_nss(1); }
+uint8_t RFM_TransferByte(uint8_t Byte)  { return hal_spi(Byte); }
+
+bool RFM_IRQ_isOn(void)   { return lmic_pins.dio[0] == LMIC_UNUSED_PIN ? \
+                                  false : digitalRead(lmic_pins.dio[0]); }
+
+#ifdef WITH_RFM95                     // RESET is active LOW
+void RFM_RESET(uint8_t On)
+{ if(On) hal_pin_rst(0);
+    else hal_pin_rst(1); }
+#endif
+
+#if defined(WITH_RFM69) || defined(WITH_SX1272) // RESET is active HIGH
+void RFM_RESET(uint8_t On)
+{ if(On) hal_pin_rst(1);
+    else hal_pin_rst(0); }
+#endif
+
+static bool ognrf_probe()
+{
+  bool success = false;
+
+  TRX.Select       = RFM_Select;
+  TRX.Deselect     = RFM_Deselect;
+  TRX.TransferByte = RFM_TransferByte;
+  TRX.RESET        = RFM_RESET;
+
+  SoC->SPI_begin();
+  hal_init_softrf (nullptr);
+
+  TRX.RESET(1);                      // RESET active
+  vTaskDelay(10);                    // wait 10ms
+  TRX.RESET(0);                      // RESET released
+  vTaskDelay(10);                    // wait 10ms
+
+  uint8_t ChipVersion = TRX.ReadVersion();
+
+  pinMode(lmic_pins.nss, INPUT);
+  SPI.end();
+
+#if defined(WITH_RFM95)
+  if (ChipVersion == 0x12 || ChipVersion == 0x13) success = true;
+#endif /* WITH_RFM95 */
+#if defined(WITH_RFM69)
+  if (ChipVersion == 0x24) success = true;
+#endif /* WITH_RFM69 */
+#if defined(WITH_SX1272)
+  if (ChipVersion == 0x22) success = true;
+#endif /* WITH_SX1272 */
+#if defined(WITH_SI4X32)
+  if (ChipVersion == 0x06 /* 4032 */ ||
+      ChipVersion == 0x08 /* 4432 */ ) success = true;
+#endif /* WITH_SI4X32 */
+
+  return success;
+}
+
+static void ognrf_channel(uint8_t channel)
+{
+  if (channel != ognrf_channel_prev) {
+
+    if (ognrf_receive_active) {
+
+      TRX.WriteMode(RF_OPMODE_STANDBY);
+      vTaskDelay(1);
+
+      /* restart Rx upon a channel switch */
+      ognrf_receive_active = false;
+    }
+
+    TRX.setChannel(channel & 0x7F);
+
+    ognrf_channel_prev = channel;
+  }
+}
+
+static void ognrf_setup()
+{
+  uint8_t TxPower = 0;
+
+  /* Enforce radio settings to follow OGNTP protocol's RF specs */
+  settings->rf_protocol = RF_PROTOCOL_OGNTP;
+
+  LMIC.protocol = &ogntp_proto_desc;
+
+  protocol_encode = &ogntp_encode;
+  protocol_decode = &ogntp_decode;
+
+  TRX.Select       = RFM_Select;
+  TRX.Deselect     = RFM_Deselect;
+  TRX.TransferByte = RFM_TransferByte;
+  TRX.DIO0_isOn    = RFM_IRQ_isOn;
+  TRX.RESET        = RFM_RESET;
+
+  SoC->SPI_begin();
+  hal_init_softrf (nullptr);
+
+  TRX.RESET(1);                      // RESET active
+  vTaskDelay(10);                    // wait 10ms
+  TRX.RESET(0);                      // RESET released
+  vTaskDelay(10);                    // wait 10ms
+
+  // set TRX base frequency and channel separation
+  TRX.setBaseFrequency(RF_FreqPlan.BaseFreq);
+  TRX.setChannelSpacing(RF_FreqPlan.ChanSepar);
+  TRX.setFrequencyCorrection(0);
+
+  TRX.Configure(0, ogntp_proto_desc.syncword);  // setup RF chip parameters and set to channel #0
+  TRX.WriteMode(RF_OPMODE_STANDBY);             // set RF chip mode to STANDBY
+
+  switch(settings->txpower)
+  {
+  case RF_TX_POWER_FULL:
+
+    /* Load regional max. EIRP at first */
+    TxPower = RF_FreqPlan.MaxTxPower;
+
+    if (TxPower > 20)
+      TxPower = 20;
+#if 1
+    if (TxPower > 17)
+      TxPower = 17;
+#endif
+
+#ifdef WITH_RFM69
+    TRX.WriteTxPower(TxPower, RFM69_POWER_RATING == 1 ? true : false);
+#else
+    TRX.WriteTxPower(TxPower);
+#endif /* WITH_RFM69 */
+    break;
+  case RF_TX_POWER_OFF:
+  case RF_TX_POWER_LOW:
+  default:
+    TRX.WriteTxPowerMin();
+    break;
+  }
+
+  /* Leave IC in standby mode */
+}
+
+static bool ognrf_receive()
+{
+  bool success = false;
+
+#if !defined(WITH_SI4X32)
+
+  uint8_t RxRSSI = 0;
+  uint8_t Err [OGNTP_PAYLOAD_SIZE + OGNTP_CRC_SIZE];
+
+  // Put into receive mode
+  if (!ognrf_receive_active) {
+
+//    TRX.ClearIrqFlags();
+
+    TRX.WriteSYNC(7, 7, ogntp_proto_desc.syncword); // Shorter SYNC for RX
+    TRX.WriteMode(RF_OPMODE_RECEIVER);
+    vTaskDelay(1);
+
+    ognrf_receive_active = true;
+  }
+
+  if(TRX.DIO0_isOn()) {
+    RxRSSI = TRX.ReadRSSI();
+
+    TRX.ReadPacket(RxBuffer, Err);
+    if (LDPC_Check((uint8_t  *) RxBuffer) == 0) {
+      success = true;
+    }
+  }
+
+  if (success) {
+    RF_last_rssi = RxRSSI;
+    rx_packets_counter++;
+  }
+
+#endif /* WITH_SI4X32 */
+
+  return success;
+}
+
+static void ognrf_transmit()
+{
+  ognrf_receive_active = false;
+
+#if defined(WITH_SI4X32)
+
+  TRX.WritePacket((uint8_t *) &TxBuffer[0]);
+  TRX.Transmit();
+  vTaskDelay(6);
+
+#else
+
+  TRX.WriteMode(RF_OPMODE_STANDBY);
+  vTaskDelay(1);
+
+  TRX.WriteSYNC(8, 7, ogntp_proto_desc.syncword);            // Full SYNC for TX
+
+  TRX.ClearIrqFlags();
+  TRX.WritePacket((uint8_t *) &TxBuffer[0]);
+
+  TRX.WriteMode(RF_OPMODE_TRANSMITTER);
+  vTaskDelay(5);
+
+  uint8_t Break=0;
+  for(uint16_t Wait=400; Wait; Wait--)        // wait for transmission to end
+  {
+    uint16_t Flags=TRX.ReadIrqFlags();
+    if(Flags&RF_IRQ_PacketSent) Break++;
+    if(Break>=2) break;
+  }
+
+  TRX.WriteMode(RF_OPMODE_STANDBY);
+
+#endif /* WITH_SI4X32 */
+}
+
+static void ognrf_shutdown()
+{
+  TRX.WriteMode(RF_OPMODE_STANDBY);
+  SPI.end();
+
+  pinMode(lmic_pins.nss, INPUT);
+}
+
+#endif /* USE_OGN_RF_DRIVER */
+
+
+// The wrapper code common to all the RF chips:
+
+// these protocols share the frequency plan and time slots
+bool in_family(uint8_t protocol)
+{
+    if (protocol == RF_PROTOCOL_LATEST)
+        return true;
+    if (protocol == RF_PROTOCOL_LEGACY)
+        return true;
+    if (protocol == RF_PROTOCOL_OGNTP)
+        return true;
+    if (protocol == RF_PROTOCOL_ADSL)
+        return true;
+    return false;
+}
+
+uint8_t useOGNfreq(uint8_t protocol)
+{
+    if (protocol == RF_PROTOCOL_OGNTP)
+        return 1;
+    //if (protocol == RF_PROTOCOL_ADSL)
+    //    return 1;
+    // - switched to using FLARM frequency for ADS-L
+    return 0;
+}
+
+byte RF_setup(void)
+{
+
+  if (rf_chip == NULL) {
+#if !defined(USE_OGN_RF_DRIVER)
+#if !defined(EXCLUDE_SX12XX)
+#if !defined(EXCLUDE_SX1276)
+    if (sx1276_ops.probe()) {
+      rf_chip = &sx1276_ops;
+#else
+    if (false) {
+#endif
+#if defined(USE_BASICMAC)
+#if !defined(EXCLUDE_SX1276)
+      SX12XX_LL = &sx127x_ll_ops;
+#endif
+    } else if (sx1262_ops.probe()) {
+      rf_chip = &sx1262_ops;
+      SX12XX_LL = &sx126x_ll_ops;
+#endif /* USE_BASICMAC */
+#else
+    if (false) {
+#endif /* EXCLUDE_SX12XX */
+#if !defined(EXCLUDE_NRF905)
+    } else if (nrf905_ops.probe()) {
+      rf_chip = &nrf905_ops;
+#endif /* EXCLUDE_NRF905 */
+#if !defined(EXCLUDE_UATM)
+    } else if (uatm_ops.probe()) {
+      rf_chip = &uatm_ops;
+#endif /* EXCLUDE_UATM */
+#if !defined(EXCLUDE_CC13XX)
+    } else if (cc13xx_ops.probe()) {
+      rf_chip = &cc13xx_ops;
+#endif /* EXCLUDE_CC13XX */
+    }
+    if (rf_chip && rf_chip->name) {
+      Serial.print(rf_chip->name);
+      Serial.println(F(" RFIC is detected."));
+    } else {
+      Serial.println(F("WARNING! None of supported RFICs is detected!"));
+    }
+#else /* USE_OGN_RF_DRIVER */
+    if (ognrf_ops.probe()) {
+      rf_chip = &ognrf_ops;
+      Serial.println(F("OGN_DRV: RFIC is detected."));
+    } else {
+      Serial.println(F("WARNING! RFIC is NOT detected."));
+    }
+#endif /* USE_OGN_RF_DRIVER */
+  }
+
+  /* "AUTO" and "UK" freqs now mapped to EU */
+  if (settings->band == RF_BAND_AUTO)
+      settings->band == RF_BAND_EU;
+  if (settings->band == RF_BAND_UK)
+      settings->band == RF_BAND_EU;
+  /* Supersede EU plan with UK when PAW is selected */
+    if (rf_chip                &&
+#if !defined(EXCLUDE_NRF905)
+        rf_chip != &nrf905_ops &&
+#endif
+        settings->band == RF_BAND_EU
+            && (settings->rf_protocol == RF_PROTOCOL_P3I || settings->altprotocol == RF_PROTOCOL_P3I))
+      settings->band == RF_BAND_UK;
+
+  if (settings->altprotocol == settings->rf_protocol
+        //|| ! in_family(settings->rf_protocol)
+        //|| ! in_family(settings->altprotocol)
+        || (rf_chip != &sx1276_ops && rf_chip != &sx1262_ops)) {
+      settings->altprotocol = RF_PROTOCOL_NONE;
+  }
+
+  const char *p = protocol_lbl(settings->rf_protocol, settings->altprotocol);
+  if (*p == '?')   // not a listed combination
+      settings->altprotocol = RF_PROTOCOL_NONE;
+
+  set_lmic_protocol(settings->altprotocol==RF_PROTOCOL_NONE? settings->rf_protocol : settings->altprotocol);
+  altprotocol_ptr = LMIC.protocol;
+  altprotocol_encode = protocol_encode;
+  altprotocol_decode = protocol_decode;
+
+  current_RX_protocol = settings->rf_protocol;
+  current_TX_protocol = settings->rf_protocol;
+  set_lmic_protocol(settings->rf_protocol);
+  curr_rx_protocol_ptr = LMIC.protocol;
+  curr_tx_protocol_ptr = LMIC.protocol;
+  mainprotocol_ptr = LMIC.protocol;
+  mainprotocol_encode = protocol_encode;
+  mainprotocol_decode = protocol_decode;
+
+  Serial.printf("Main RF protocol: %d\r\n", mainprotocol_ptr->type);
+  Serial.printf(" Alt RF protocol: %d\r\n",  altprotocol_ptr->type);
+
+  RF_FreqPlan.setPlan(settings->band, current_RX_protocol);
+
+  if (settings->rf_protocol==RF_PROTOCOL_LATEST && settings->altprotocol==RF_PROTOCOL_ADSL) {
+       if (settings->flr_adsl) {     // use dual-protocol reception trick
+           dual_protocol = RF_FLR_ADSL;
+           Serial.println("set up FLR_ADSL rx, FLR tx + some ADSL tx");
+       } else {
+           Serial.println("set up FLR rx & tx + some ADSL tx");
+       }
+  }
+  if (settings->rf_protocol==RF_PROTOCOL_ADSL && settings->altprotocol==RF_PROTOCOL_LATEST) {
+       if (settings->flr_adsl) {     // use dual-protocol reception trick
+           dual_protocol = RF_FLR_ADSL;
+           Serial.println("set up FLR_ADSL rx, ADSL tx + some FLR tx");
+       } else {
+           Serial.println("set up ADSL rx & tx + some FLR tx");
+       }
+  }
+  if (settings->rf_protocol==RF_PROTOCOL_LATEST && settings->altprotocol==RF_PROTOCOL_OGNTP) {
+       if (settings->flr_adsl) {
+           dual_protocol = RF_FLR_ADSL;
+           Serial.println("set up FLR_ADSL rx + some OGNTP tx");
+       } else {
+           Serial.println("set up FLR rx & tx + some OGNTP tx");
+       }
+  }
+  if ((settings->rf_protocol==RF_PROTOCOL_LATEST && settings->altprotocol==RF_PROTOCOL_FANET)
+  ||  (settings->rf_protocol==RF_PROTOCOL_FANET  && settings->altprotocol==RF_PROTOCOL_LATEST)) {
+       dual_protocol = RF_FLR_FANET;
+       if (settings->flr_adsl)
+           Serial.println("set up FLR_FANET time slicing, FLR_ADSL rx + some ADSL tx");
+       else
+           Serial.println("set up FLR_FANET time slicing");
+  }
+  if (settings->rf_protocol==RF_PROTOCOL_FANET && settings->altprotocol==RF_PROTOCOL_ADSL) {
+       dual_protocol = RF_FLR_FANET;
+       if (settings->flr_adsl)
+           Serial.println("set up FANET+ADSL time slicing, FLR_ADSL rx + ADSL tx");
+       else
+           Serial.println("set up FANET+ADSL time slicing");
+  }
+  if (settings->rf_protocol==RF_PROTOCOL_FANET && settings->altprotocol==RF_PROTOCOL_OGNTP) {
+       dual_protocol = RF_FLR_FANET;
+       Serial.println("set up FANET_OGNTP time slicing");
+       if (settings->flr_adsl)
+           Serial.println("set up FANET+OGNTP time slicing, FLR_ADSL rx, some ADSL tx");
+       else
+           Serial.println("set up FANET+OGNTP time slicing");
+  }
+  if ((settings->rf_protocol==RF_PROTOCOL_LATEST && settings->altprotocol==RF_PROTOCOL_P3I)
+  ||  (settings->rf_protocol==RF_PROTOCOL_P3I    && settings->altprotocol==RF_PROTOCOL_LATEST)) {
+       dual_protocol = RF_FLR_P3I;
+       if (settings->flr_adsl)
+           Serial.println("set up FLR_FP3I time slicing, FLR_ADSL rx + some ADSL tx");
+       else
+           Serial.println("set up FLR_P3I time slicing");
+
+  }
+  if (settings->rf_protocol==RF_PROTOCOL_P3I && settings->altprotocol==RF_PROTOCOL_ADSL) {
+       dual_protocol = RF_FLR_P3I;
+       if (settings->flr_adsl)
+           Serial.println("set up P3I+ADSL time slicing, FLR_ADSL rx + ADSL tx");
+       else
+           Serial.println("set up P3I+ADSL time slicing");
+  }
+  if (settings->rf_protocol==RF_PROTOCOL_P3I && settings->altprotocol==RF_PROTOCOL_OGNTP) {
+       dual_protocol = RF_FLR_P3I;
+       Serial.println("set up P3I_OGNTP time slicing");
+       if (settings->flr_adsl)
+           Serial.println("set up P3I+OGNTP time slicing, FLR_ADSL rx, some ADSL tx");
+       else
+           Serial.println("set up P3I+OGNTP time slicing");
+  }
+
+  if (rf_chip) {
+
+    rf_chip->setup();
+
+    const rf_proto_desc_t *p = mainprotocol_ptr;
+
+    RF_timing         = p->tm_type;
+
+    ts                = &Time_Slots;
+    ts->air_time      = p->air_time;
+    ts->interval_min  = p->tx_interval_min;
+    ts->interval_max  = p->tx_interval_max;
+    ts->interval_mid  = (p->tx_interval_max + p->tx_interval_min) / 2;
+    ts->s0.begin      = p->slot0.begin;
+    ts->s1.begin      = p->slot1.begin;
+    ts->s0.duration   = p->slot0.end - p->slot0.begin;
+    ts->s1.duration   = p->slot1.end - p->slot1.begin;
+
+    uint16_t duration = ts->s0.duration + ts->s1.duration;
+    ts->adj = duration > ts->interval_mid ? 0 : (ts->interval_mid - duration) / 2;
+
+    return rf_chip->type;
+
+  }
+
+  return RF_IC_NONE;
+}
+
+void RF_chip_channel(uint8_t protocol)
+{
+    uint8_t OGN = useOGNfreq(protocol);
+    RF_current_chan = RF_FreqPlan.getChannel((time_t)RF_time, RF_current_slot, OGN);
+    if (rf_chip)
+        rf_chip->channel(RF_current_chan);
+}
+
+void RF_chip_reset(uint8_t protocol)
+{
+#if defined(USE_BASICMAC)
+#if !defined(EXCLUDE_SX12XX)
+    if (rf_chip == &sx1276_ops || rf_chip == &sx1262_ops)
+        sx12xx_resetup();
+#endif
+#endif
+    RF_chip_channel(protocol);
+//Serial.printf("reset to Prot %d at millis %d, tx ok %d - %d, gd to %d\r\n",
+//current_RX_protocol, millis(), TxTimeMarker, TxEndMarker, RF_OK_until);
+}
+
+/* original code, now only called for protocols other than Legacy: */
+void RF_SetChannel(void)
+{
+  tmElements_t  tm;
+  time_t        Time;
+  uint8_t       Slot;
+  uint32_t now_ms, pps_btime_ms, time_corr_neg;
+
+  switch (settings->mode)
+  {
+  case SOFTRF_MODE_TXRX_TEST:
+    Time = OurTime;
+    RF_timing = RF_timing == RF_TIMING_2SLOTS_PPS_SYNC ?
+                RF_TIMING_INTERVAL : RF_timing;
+    break;
+#if !defined(EXCLUDE_MAVLINK)
+  case SOFTRF_MODE_UAV:
+    Time = the_aircraft.location.gps_time_stamp / 1000000;
+    RF_timing = RF_timing == RF_TIMING_2SLOTS_PPS_SYNC ?
+                RF_TIMING_INTERVAL : RF_timing;
+    break;
+#endif /* EXCLUDE_MAVLINK */
+
+  case SOFTRF_MODE_NORMAL:
+  default:
+
+    now_ms = millis();
+    pps_btime_ms = SoC->get_PPS_TimeMarker();
+
+    if (pps_btime_ms) {
+      if (now_ms > pps_btime_ms + 1010)
+        pps_btime_ms += 1000;
+      uint32_t last_Commit_Time = now_ms - gnss.time.age();
+      if (pps_btime_ms <= last_Commit_Time) {
+        time_corr_neg = (last_Commit_Time - pps_btime_ms) % 1000;
+      } else {
+        time_corr_neg = 1000 - ((pps_btime_ms - last_Commit_Time) % 1000);
+      }
+      ref_time_ms = pps_btime_ms;
+    } else {
+      uint32_t last_RMC_Commit = now_ms - gnss.date.age();
+      time_corr_neg = 100;
+      if (gnss_chip)
+          time_corr_neg = gnss_chip->rmc_ms;
+      ref_time_ms = last_RMC_Commit - time_corr_neg;
+    }
+
+    int yr    = gnss.date.year();
+    if( yr > 99)
+        yr    = yr - 1970;
+    else
+        yr    += 30;
+    tm.Year   = yr;
+    tm.Month  = gnss.date.month();
+    tm.Day    = gnss.date.day();
+    tm.Hour   = gnss.time.hour();
+    tm.Minute = gnss.time.minute();
+    tm.Second = gnss.time.second();
+
+//  Time = makeTime(tm) + (gnss.time.age() - time_corr_neg) / 1000;
+    Time = makeTime(tm) + (gnss.time.age() + time_corr_neg) / 1000;
+    OurTime = (uint32_t) Time;
+    RF_time = OurTime;
+
+    break;
+  }
+
+  switch (RF_timing)
+  {
+  case RF_TIMING_2SLOTS_PPS_SYNC:
+    if ((now_ms - ts->s0.tmarker) >= ts->interval_mid) {
+      ts->s0.tmarker = ref_time_ms + ts->s0.begin - ts->adj;
+      ts->current = 0;
+    }
+    if ((now_ms - ts->s1.tmarker) >= ts->interval_mid) {
+      ts->s1.tmarker = ref_time_ms + ts->s1.begin;
+      ts->current = 1;
+    }
+    Slot = ts->current;
+    break;
+  case RF_TIMING_INTERVAL:
+  default:
+    Slot = 0;
+    break;
+  }
+
+  uint8_t OGN = useOGNfreq(settings->rf_protocol);
+  uint8_t chan = RF_FreqPlan.getChannel(Time, Slot, OGN);
+
+#if DEBUG
+  int("Plan: "); Serial.println(RF_FreqPlan.Plan);
+  Serial.print("Slot: "); Serial.println(Slot);
+  Serial.print("OGN: "); Serial.println(OGN);
+  Serial.print("Channel: "); Serial.println(chan);
+#endif
+
+  if (RF_ready && rf_chip) {
+    rf_chip->channel(chan);
+  }
+}
+
+void set_protocol_for_slot()
+{
+  //uint8_t prev_protocol = current_RX_protocol;
+
+  // Transmit one packet in alt protocol once every 4 seconds:
+  // In time Slot 0 for ADS-L & FLR, and in Slot 1 for OGNTP.
+  // If alt protocol is OGNTP transmit in third protocol in seconds 3,11
+  // This arrangement is not used for time-slicing with FANET or P3I
+
+  bool sec_3_7_11_15 = ((RF_time & 0x03) == 0x03);
+  bool sec_3_11      = ((RF_time & 0x07) == 0x03);
+
+  if (RF_current_slot == 0) {
+
+    if (dual_protocol == RF_FLR_FANET || dual_protocol == RF_FLR_P3I) {
+        if (sec_3_11 && settings->flr_adsl) {
+            curr_rx_protocol_ptr = &flr_adsl_proto_desc;
+            protocol_decode = &flr_adsl_decode;     // <<< this gets re-done in receive()
+            if (settings->altprotocol == RF_PROTOCOL_ADSL) {
+                curr_tx_protocol_ptr = &latest_proto_desc;
+                protocol_encode = &legacy_encode;
+            } else {     // altprotocol is Latest or OGNTP
+                curr_tx_protocol_ptr = &adsl_proto_desc;
+                protocol_encode = &adsl_encode;
+            }
+        } else if (settings->rf_protocol != RF_PROTOCOL_FANET && settings->rf_protocol != RF_PROTOCOL_P3I) {
+            curr_tx_protocol_ptr = mainprotocol_ptr;
+            protocol_encode = mainprotocol_encode;
+            if (settings->flr_adsl) {
+                curr_rx_protocol_ptr = &flr_adsl_proto_desc;
+                protocol_decode = &flr_adsl_decode;           // <<< this gets re-done in receive()
+            } else {
+                curr_rx_protocol_ptr = mainprotocol_ptr;
+                protocol_decode = mainprotocol_decode;
+            }
+        } else if (settings->altprotocol != RF_PROTOCOL_FANET && settings->altprotocol != RF_PROTOCOL_P3I) {
+            curr_tx_protocol_ptr = altprotocol_ptr;
+            protocol_encode = altprotocol_encode;
+            if (settings->flr_adsl && settings->altprotocol != RF_PROTOCOL_OGNTP) {
+                curr_rx_protocol_ptr = &flr_adsl_proto_desc;
+                protocol_decode = &flr_adsl_decode;           // <<< this gets re-done in receive()
+            } else {
+                curr_rx_protocol_ptr = altprotocol_ptr;
+                protocol_decode = altprotocol_decode;
+            }
+        }
+    } else if (sec_3_7_11_15 && settings->altprotocol != RF_PROTOCOL_NONE) {
+        if (settings->altprotocol == RF_PROTOCOL_OGNTP) {
+            if (sec_3_11 && settings->flr_adsl && settings->rf_protocol != RF_PROTOCOL_ADSL) {
+                curr_rx_protocol_ptr = &flr_adsl_proto_desc;
+                curr_tx_protocol_ptr = &adsl_proto_desc;
+                protocol_decode = &flr_adsl_decode;   // <<< this gets re-done in receive()
+                protocol_encode = &adsl_encode;
+            } else {
+                // stay in main protocol
+                // - will transmit in OGNTP in Slot 1
+                curr_rx_protocol_ptr = mainprotocol_ptr;
+                curr_tx_protocol_ptr = mainprotocol_ptr;
+                protocol_decode = mainprotocol_decode;
+                protocol_encode = mainprotocol_encode;
+            }
+        } else {    // Latest+ADSL, or ADSL+Latest
+            if (settings->flr_adsl
+             && (settings->altprotocol == RF_PROTOCOL_LATEST
+              || settings->altprotocol == RF_PROTOCOL_ADSL)) {
+                curr_rx_protocol_ptr = &flr_adsl_proto_desc;
+                protocol_decode = &flr_adsl_decode;   // <<< this gets re-done in receive()
+            } else {
+                curr_rx_protocol_ptr = mainprotocol_ptr;
+                protocol_decode = mainprotocol_decode;
+            }
+            curr_tx_protocol_ptr = altprotocol_ptr;
+            protocol_encode = altprotocol_encode;
+        }
+    } else {    // single protocol
+        if (settings->flr_adsl
+         && (settings->rf_protocol == RF_PROTOCOL_LATEST || settings->rf_protocol == RF_PROTOCOL_ADSL)) {
+            curr_rx_protocol_ptr = &flr_adsl_proto_desc;
+            protocol_decode = &flr_adsl_decode;   // <<< this gets re-done in receive()
+        } else if (sec_3_7_11_15 && settings->flr_adsl && settings->rf_protocol == RF_PROTOCOL_OGNTP) {
+            curr_rx_protocol_ptr = &flr_adsl_proto_desc;
+            protocol_decode = &flr_adsl_decode;
+        } else {
+            curr_rx_protocol_ptr = mainprotocol_ptr;
+            protocol_decode = mainprotocol_decode;
+        }
+        curr_tx_protocol_ptr = mainprotocol_ptr;
+        protocol_encode = mainprotocol_encode;
+    }
+
+  } else {  // slot 1
+
+    if (dual_protocol == RF_FLR_FANET) {
+#if 1
+        // FANET+ (at least XCtracer) only transmits FLARM in Slot 1 of odd seconds
+        // So listen for FLARM in Slot 1 every 4 seconds in odd seconds
+        // This reduces the reception of FANET by 25%
+        if (sec_3_7_11_15) {
+            if (settings->flr_adsl) {
+                curr_rx_protocol_ptr = &flr_adsl_proto_desc;
+                protocol_decode = &flr_adsl_decode;
+            } else {
+                curr_rx_protocol_ptr = &latest_proto_desc;
+                protocol_decode = &legacy_decode;
+            }
+        } else
+#endif
+        {
+            curr_rx_protocol_ptr = &fanet_proto_desc;
+            protocol_decode = &fanet_decode;
+        }
+        curr_tx_protocol_ptr = &fanet_proto_desc;
+        protocol_encode = &fanet_encode;
+    } else if (dual_protocol == RF_FLR_P3I) {
+        curr_rx_protocol_ptr = &p3i_proto_desc;
+        curr_tx_protocol_ptr = &p3i_proto_desc;
+        protocol_decode = &p3i_decode;
+        protocol_encode = &p3i_encode;
+    } else if (sec_3_7_11_15 && settings->altprotocol == RF_PROTOCOL_OGNTP) {
+        if (sec_3_11 && settings->flr_adsl && settings->rf_protocol != RF_PROTOCOL_ADSL) {
+            // stay in main protocol - transmitted ADSL in slot 0
+            curr_rx_protocol_ptr = mainprotocol_ptr;
+            curr_tx_protocol_ptr = mainprotocol_ptr;
+            protocol_decode = mainprotocol_decode;
+            protocol_encode = mainprotocol_encode;
+        } else {
+            curr_rx_protocol_ptr = mainprotocol_ptr;
+            curr_tx_protocol_ptr = &ogntp_proto_desc;
+            protocol_decode = mainprotocol_decode;
+            protocol_encode = &ogntp_encode;
+        }
+    } else {
+        curr_rx_protocol_ptr = mainprotocol_ptr;
+        curr_tx_protocol_ptr = mainprotocol_ptr;
+        protocol_decode = mainprotocol_decode;
+        protocol_encode = mainprotocol_encode;
+    }
+    // note: no flr_adsl rx in slot 1 even if settings->flr_adsl
+  }
+
+  current_RX_protocol = curr_rx_protocol_ptr->type;
+  current_TX_protocol = curr_tx_protocol_ptr->type;
+#if 0
+  rx_flr_adsl = (dual_protocol == RF_FLR_ADSL  // <<< does not happen unless settings->flr_adsl
+              || (settings->flr_adsl
+                  && (current_RX_protocol==RF_PROTOCOL_LATEST || current_RX_protocol==RF_PROTOCOL_ADSL)));
+#else
+  rx_flr_adsl = (curr_rx_protocol_ptr == &flr_adsl_proto_desc);
+#endif
+
+  //if (current_RX_protocol != prev_protocol)
+  //    RF_FreqPlan.setPlan(settings->band, current_RX_protocol);
+
+  if (LMIC.protocol != curr_rx_protocol_ptr) {
+      RF_FreqPlan.setPlan(settings->band, current_RX_protocol);
+      LMIC.protocol = curr_rx_protocol_ptr;    // tx will switch to curr_tx_protocol_ptr
+      RF_chip_reset(current_RX_protocol);
+  } else {
+      RF_chip_channel(current_RX_protocol);
+  }
+
+/*
+  if (dual_protocol == RF_SINGLE_PROTOCOL && current_TX_protocol != settings->rf_protocol) {
+      Serial.print("set up to tx one time slot in protocol ");
+      Serial.print(current_TX_protocol);
+      Serial.print(" rather than ");
+      Serial.println(settings->rf_protocol);
+  }
+*/
+}
+
+void RF_loop()
+{
+  if (!RF_ready) {
+    if (RF_FreqPlan.Plan == RF_BAND_AUTO) {   // never happens, since setup() overrode AUTO
+      if (ThisAircraft.latitude || ThisAircraft.longitude) {
+        settings->band = RF_FreqPlan.calcPlan((int32_t)(ThisAircraft.latitude  * 600000),
+                                              (int32_t)(ThisAircraft.longitude * 600000));
+        RF_FreqPlan.setPlan(settings->band, current_RX_protocol);
+        RF_ready = true;
+      }
+    } else {
+      RF_ready = true;
+    }
+  }
+
+//  if (dual_protocol == RF_SINGLE_PROTOCOL
+//   && current_RX_protocol == settings->rf_protocol
+//   && in_family(settings->rf_protocol) == false) {
+
+  if (settings->altprotocol == RF_PROTOCOL_NONE
+   && in_family(settings->rf_protocol) == false) {
+      RF_SetChannel();    /* use original code */
+      return;
+  }
+
+  /* Experimental code by Moshe Braner, specific to Legacy Protocol (and related protocols) */
+  /* More correct on frequency hopping & time slots, and uses less CPU time */
+  /* - requires OurTime to be set to UTC time in seconds - can do in Time_loop() */
+  /* - also needs time since PPS, it is stored in ref_time_ms */
+
+  if (ref_time_ms == 0)    /* no GNSS time yet */
+    return;
+
+  uint32_t now_ms = millis();
+
+  // no need to adjust RF_time until setting up a new Time Slot
+  if (now_ms < RF_OK_until)      /* channel already computed */
+      return;
+
+  RF_time = OurTime;      // OurTime may have been updated in Time_loop since last RF_loop
+
+  if (now_ms < ref_time_ms) {   /* should not happen */
+    --OurTime;
+    ref_time_ms -= 1000;
+    return;
+  }
+
+  uint32_t ms_since_pps = now_ms - ref_time_ms;
+  if (ms_since_pps >= 1300) {   // should not happen since Time_loop takes care of this
+    ++OurTime;
+    ++RF_time;
+    ref_time_ms += 1000;
+    ms_since_pps -= 1000;
+  }
+
+  uint32_t slot_base_ms = ref_time_ms;
+  if (ms_since_pps < 300) {  /* does not happen often? */
+    /* channel does _NOT_ change at PPS rollover in middle of slot 1 */
+    /* - therefore change the reference second to the previous one: */
+    --RF_time;
+    slot_base_ms -= 1000;
+    ms_since_pps += 1000;
+  }
+
+  bool sec_15 = ((RF_time & 0x0F) == 0x0F);
+
+  if (ms_since_pps >= 380 && ms_since_pps < 800) {
+
+    RF_current_slot = 0;
+    set_protocol_for_slot();
+    RF_OK_from  = slot_base_ms + 405;
+    RF_OK_until = slot_base_ms + 800;
+    TxEndMarker = slot_base_ms + 795;
+    if (relay_next) {
+        TxTimeMarker = TxEndMarker;     // prevent transmission (relay bypasses this)
+        relay_next = false;
+    } else if (current_TX_protocol == RF_PROTOCOL_ADSL) {  // ADS-L slot starts at 450
+        TxTimeMarker = slot_base_ms + 455 + SoC->random(0, 335);
+    } else {
+        TxTimeMarker = slot_base_ms + 405 + SoC->random(0, 385);
+    }
+
+  } else if (ms_since_pps >= 800 && ms_since_pps < 1300) {
+
+    RF_current_slot = 1;
+    set_protocol_for_slot();
+    /* channel does _NOT_ change at PPS rollover in middle of slot 1 */
+    RF_OK_from  = slot_base_ms + 805;
+    RF_OK_until = slot_base_ms + 1380;
+    if (dual_protocol == RF_FLR_FANET || dual_protocol == RF_FLR_P3I) {
+        TxTimeMarker = RF_OK_until;          /* transmit only in FANET/P3I */
+        TxEndMarker = slot_base_ms + 1370;
+        if (TxTimeMarker2 == 0) {   // tx happened in previous Slot 1
+            uint32_t interval;
+            if (dual_protocol == RF_FLR_FANET)
+                interval = 3805;
+            else              // RF_FLR_P3I
+                interval = 1805;
+            uint32_t when = SoC->random(0, (565+565));
+            if (when < 565)       // 50% chance
+                when += 1000;     // tx any time in slot 1, 3 (or 4) seconds in the future
+            else if (when > 848)  // 25% chance
+                when -= 565;      // tx in second half of slot 1 but a second earlier
+            else
+                when += (2000 - 565);   // first half of slot 1, a second later
+            TxTimeMarker2 = slot_base_ms + interval + when;
+            // average interval 3 sec for P3I and 5 sec for FANET
+        }
+    } else if (current_TX_protocol == RF_PROTOCOL_ADSL) {
+        // For ADS-L the official time slot ends at 1000,
+        // and also not supposed to transmit fix more than 500 ms old:
+        // Only transmit ADS-L in Slot 0, except for relaying:
+        TxEndMarker = slot_base_ms + 995;
+        TxTimeMarker = TxEndMarker;         // prevent transmission (relay bypasses this)
+    } else if (sec_15 && current_TX_protocol == RF_PROTOCOL_LATEST) {
+        // Some other receivers may mis-decrypt packets sent after the next PPS
+        // so limit the transmissions to the pre-PPS half of the slot.
+        TxEndMarker = slot_base_ms + 995;
+        //TxTimeMarker = slot_base_ms + 805 + SoC->random(0, 185);
+        TxTimeMarker = slot_base_ms + 805 + SoC->random(0, 385);
+        if (TxTimeMarker > TxEndMarker)     // in 50% of the cases no tx in slot 1 in sec 15:
+            TxTimeMarker = TxEndMarker;     // prevent transmission (relay bypasses this)
+    } else {   // Legacy, OGNTP
+        TxEndMarker = slot_base_ms + 1195;
+        TxTimeMarker = slot_base_ms + 805 + SoC->random(0, 385);
+    }
+
+  } else { /* now 300-380 ms and somehow have not set up Slot 1 */
+
+//Serial.println("<380 ms and somehow...");
+    RF_current_slot = 1;
+    set_protocol_for_slot();
+    RF_OK_until = slot_base_ms + 380;
+    RF_OK_from   = RF_OK_until;
+    TxTimeMarker = RF_OK_until;          /* do not transmit for now */
+    TxEndMarker  = RF_OK_until;
+    return;
+  }
+
+  if (alt_relay_next) {                   // only happens when altprotocol == RF_PROTOCOL_OGNTP
+      if (sec_15) {                       // second 15, slot 1
+          TxTimeMarker = TxEndMarker;     // prevent transmission (relay bypasses this)
+          alt_relay_next = false;
+      }
+  }
+
+/*
+  if (settings->debug_flags & DEBUG_DEEPER) {
+      Serial.print("New freq at: ");
+      Serial.print(now_ms - slot_base_ms);                   
+      Serial.print(" ms after PPS, OK until ");
+      Serial.println(RF_OK_until - slot_base_ms);
+  }
+*/
+if (settings->debug_flags & DEBUG_DEEPER) {
+Serial.printf("Prot %d/%d(%s), Slot %d set for sec %d at PPS+%d ms, PPS %d, tx ok %d - %d, gd to %d\r\n",
+current_RX_protocol, current_TX_protocol, ((curr_tx_protocol_ptr == &latest_proto_desc)? "T" : "?"),
+   RF_current_slot, (RF_time & 0x0F), ms_since_pps, slot_base_ms,
+   ((current_TX_protocol==RF_PROTOCOL_FANET || current_TX_protocol==RF_PROTOCOL_P3I)? TxTimeMarker2 : TxTimeMarker),
+    TxEndMarker, RF_OK_until);
+}
+}
+
+bool RF_Transmit_Happened()
+{
+    if (dual_protocol == RF_FLR_FANET && current_TX_protocol == RF_PROTOCOL_FANET)
+        return (TxTimeMarker2 == 0);
+    if (dual_protocol == RF_FLR_P3I && current_TX_protocol == RF_PROTOCOL_P3I)
+        return (TxTimeMarker2 == 0);
+    if (! TxEndMarker)
+        return (TxTimeMarker > millis());   // for protocols handled by the original code
+    return (TxTimeMarker >= RF_OK_until);
+}
+
+bool RF_Transmit_Ready(bool wait)
+{
+    //if (RF_Transmit_Happened())
+    //    return false;
+    uint32_t now_ms = millis();
+    if ((dual_protocol == RF_FLR_FANET && current_TX_protocol == RF_PROTOCOL_FANET)
+    ||  (dual_protocol == RF_FLR_P3I   && current_TX_protocol == RF_PROTOCOL_P3I))
+        return (TxTimeMarker2 != 0 && now_ms > TxTimeMarker2 && now_ms < TxEndMarker);
+    if (! TxEndMarker)                     // for protocols handled by the original code
+        return (now_ms > TxTimeMarker);
+    return (now_ms >= (wait? TxTimeMarker : RF_OK_from) && now_ms < TxEndMarker);
+}
+
+size_t RF_Encode(container_t *fop, bool wait)
+{
+  if (settings->txpower == RF_TX_POWER_OFF)
+      return 0;
+
+  if (! RF_ready)
+      return 0;
+
+  size_t size = 0;
+
+  if (protocol_encode) {
+
+    /* sanity checks: don't send bad data */
+    const char *p = NULL;
+    if (fop->latitude == 0.0)
+        p = "position";
+    else if (fop->altitude > 30000.0)   // meters
+        p = "altitude";
+    else if (fop->speed > (300.0 / _GPS_MPS_PER_KNOT))   // 300 m/s or about 600 knots
+        p = "speed";
+    else if (fabs(fop->vs) > (20.0 * (_GPS_FEET_PER_METER * 60.0))
+             && fop->aircraft_type != AIRCRAFT_TYPE_JET && fop->aircraft_type != AIRCRAFT_TYPE_UFO)
+        p = "vs";
+    else if (fabs(fop->turnrate) > 100.0)
+        p = "turnrate";
+    if (p) {
+        Serial.print("skipping sending bad ");
+        Serial.println(p);
+        return 0;
+    }
+
+    // encode in the current tx protocol
+    if (RF_Transmit_Ready(wait)) 
+        size = (*protocol_encode)((void *) &TxBuffer[0], fop);
+
+  }
+
+  return size;
+}
+
+bool RF_Transmit(size_t size, bool wait)   // called with no-wait only for air-relay
+{
+  if (RF_ready && rf_chip && (size > 0)) {
+
+    RF_tx_size = size;
+
+    if (in_family(current_TX_protocol)
+     || current_TX_protocol != settings->rf_protocol
+     || dual_protocol != RF_SINGLE_PROTOCOL) {
+
+      /* Experimental code by Moshe Braner */
+
+      if (RF_Transmit_Ready(wait)) {
+
+        if (current_TX_protocol == RF_PROTOCOL_ADSL) {
+            // for relaying in ADS-L instead of normal protocol
+            curr_tx_protocol_ptr = &adsl_proto_desc;
+        }
+        if (LMIC.protocol != curr_tx_protocol_ptr) {
+            // (usually LMIC.protocol was set in set_protocol_for_slot())
+            RF_FreqPlan.setPlan(settings->band, current_TX_protocol);
+            LMIC.protocol = curr_tx_protocol_ptr;
+            RF_chip_reset(current_TX_protocol);
+        }
+
+        bool success = true;
+        if (settings->txpower != RF_TX_POWER_OFF) {
+            rf_chip->transmit();
+            if (RF_tx_size != 0)
+                tx_packets_counter++;
+            else
+                success = false;
+
+if (settings->debug_flags & DEBUG_DEEPER) {
+Serial.printf("TX in protocol %d(%s) at %d ms, size=%d\r\n",
+    current_TX_protocol, ((LMIC.protocol == &latest_proto_desc)? "T" : "?"),
+    millis()-ref_time_ms, RF_tx_size);
+}
+            RF_tx_size = 0;
+        }
+
+//        if (RF_tx_size == 0) {   // tx timed out
+//            //Serial.println("TX timed out");
+//            return false;
+//        }
+//        RF_tx_size = 0;
+
+//Serial.printf("TX at millis %d\r\n", millis());
+
+        if (dual_protocol == RF_FLR_FANET) {
+//if (current_TX_protocol == RF_PROTOCOL_FANET)
+//Serial.println("setting TxTimeMarker2 to 0");
+            if (current_TX_protocol == RF_PROTOCOL_FANET)
+                TxTimeMarker2 = 0;
+            else
+                TxTimeMarker = RF_OK_until;
+        } else if (dual_protocol == RF_FLR_P3I) {
+            if (current_TX_protocol == RF_PROTOCOL_P3I)
+                TxTimeMarker2 = 0;
+            else
+                TxTimeMarker = RF_OK_until;
+        } else {
+            TxTimeMarker = RF_OK_until;  // do not transmit again (even relay) until next slot
+            /* do not set next transmit time here - it is done in RF_loop() */
+            if (curr_tx_protocol_ptr != curr_rx_protocol_ptr) {
+                // go back to rx mode ASAP
+                //delay(20);    // <<< can this delay be safely shortened?
+                delay(10);      // maybe even less, if "sx12xx_transmit_complete" means what it says?
+                RF_FreqPlan.setPlan(settings->band, current_RX_protocol);
+                LMIC.protocol = curr_rx_protocol_ptr;
+                RF_chip_reset(current_RX_protocol);     // <<< may want to condition this?
+                //Serial.println("returned to normal protocol...");
+            }
+        }
+
+//Serial.println(">");
+//Serial.printf("> tx at %d s + %d ms\r\n", OurTime, millis()-ref_time_ms);
+#if 0
+if ((settings->debug_flags & (DEBUG_DEEPER | DEBUG_LEGACY)) == (DEBUG_DEEPER | DEBUG_LEGACY)) {
+uint32_t ms = millis();
+if (ms < ref_time_ms)  ms = 0;
+else   ms -= ref_time_ms;
+if (ms > 999)  ms = 999;
+Serial.printf("> tx %d s %3d ms (%02d:%02d) timebits %2d chan %2d\r\n",
+OurTime, ms, (int)gnss.time.minute(), (int)gnss.time.second(), (RF_time & 0x0F), RF_current_chan);
+}
+#endif
+
+//Serial.printf("> tx at ms PPS + %d ms, now TxTimeMarker = PPS + %d\r\n",
+//millis()-ref_time_ms, TxTimeMarker-ref_time_ms);
+
+        return success;
+      }
+
+      return false;
+    }
+
+    /* original code for other protocols: */
+
+    if (!wait || millis() > TxTimeMarker) {
+
+      uint32_t timestamp = OurTime;
+
+      if (settings->txpower != RF_TX_POWER_OFF) {
+        rf_chip->transmit();
+        tx_packets_counter++;
+      }
+
+      if (settings->nmea_p) {
+        StdOut.print(F("$PSRFO,"));
+        StdOut.print((uint32_t) timestamp);
+        StdOut.print(F(","));
+        StdOut.println(Bin2Hex((byte *) &TxBuffer[0],
+                               RF_Payload_Size(current_TX_protocol)));
+      }
+      RF_tx_size = 0;
+
+      Slot_descr_t *next;
+      uint32_t adj;
+
+      switch (RF_timing)
+      {
+      case RF_TIMING_2SLOTS_PPS_SYNC:
+        next = RF_FreqPlan.Channels == 1 ? &(ts->s0) :
+               ts->current          == 1 ? &(ts->s0) : &(ts->s1);
+        adj  = ts->current ? ts->adj   : 0;
+        TxTimeMarker = next->tmarker    +
+                       ts->interval_mid +
+                       SoC->random(adj, next->duration - ts->air_time);
+        break;
+      case RF_TIMING_INTERVAL:
+      default:
+        TxTimeMarker = millis() + SoC->random(ts->interval_min, ts->interval_max) - ts->air_time;
+        break;
+      }
+
+Serial.printf("> orig-code tx at ms %d, now TxTimeMarker = %d\r\n", millis(), TxTimeMarker);
+
+      return true;
+    }
+  }
+  return false;
+}
+
+bool RF_Receive(void)
+{
+  bool rval = false;
+
+  if (RF_ready && rf_chip) {
+    rval = rf_chip->receive();
+  }
+
+//if (rval)
+//Serial.printf("rx at %d s + %d ms\r\n", OurTime, millis()-ref_time_ms);
+
+  return rval;
+}
+
+void RF_Shutdown(void)
+{
+  if (rf_chip) {
+    rf_chip->shutdown();
+  }
+}
+
+uint8_t RF_Payload_Size(uint8_t protocol)
+{
+  switch (protocol)
+  {
+    case RF_PROTOCOL_LATEST:    return latest_proto_desc.payload_size;
+    case RF_PROTOCOL_LEGACY:    return legacy_proto_desc.payload_size;
+    case RF_PROTOCOL_OGNTP:     return ogntp_proto_desc.payload_size;
+    case RF_PROTOCOL_ADSL:      return adsl_proto_desc.payload_size;
+    case RF_PROTOCOL_P3I:       return p3i_proto_desc.payload_size;
+    case RF_PROTOCOL_FANET:     return fanet_proto_desc.payload_size;
+#if !defined(EXCLUDE_UAT978)
+    case RF_PROTOCOL_ADSB_UAT:  return uat978_proto_desc.payload_size;
+#endif
+    default:                    return 0;
+  }
+}

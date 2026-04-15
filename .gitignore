@@ -1,0 +1,29 @@
+# Arduino / build files
+*.o
+*.a
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+
+build/
+build-*/
+
+# Arduino CLI / cache
+*.cache
+*.tmp
+
+# PlatformIO (ako se ikad pojavi)
+.pio/
+
+# ESP32 / toolchain junk
+*.elf.*
+*.partitions.bin
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Arduino logs
+*.log
