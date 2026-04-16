@@ -1,3 +1,6 @@
+// ESP32.h workspace for Heltec WT port
+// Source: sasam/SoftRF-MB179-SM -> softrf-mb179-heltec-s3-sm/src/platform/ESP32.h
+// If the full file did not load previously, paste it here and we will edit it together.
 /*
  * Platform_ESP32.h
  * Copyright (C) 2018-2022 Linar Yusupov
@@ -28,6 +31,7 @@
 #include <Update.h>
 #include <WiFiClient.h>
 #include <SPIFFS.h>
+#include "iomap/Heltec_Tracker.h"
 
 /* Maximum of tracked flying objects is now SoC-specific constant */
 #define MAX_TRACKING_OBJECTS    8
@@ -394,6 +398,7 @@ enum esp32_board_id {
   ESP32_TTGO_T_WATCH,
   ESP32_S2_T8_V1_1,
   ESP32_S3_DEVKIT,
+  ESP32_HELTEC_TRACKER,
 };
 
 /* https://github.com/espressif/usb-pids/blob/main/allocated-pids.txt#L313 */
@@ -402,6 +407,7 @@ enum softrf_usb_pid {
   SOFTRF_USB_PID_STANDALONE = 0x8132,
   SOFTRF_USB_PID_PRIME_MK3  = 0x8133,
   SOFTRF_USB_PID_UF2_BOOT   = 0x8134,
+  SOFTRF_USB_PID_MIDI       = 0x81A0,
 };
 
 struct rst_info {
@@ -520,3 +526,5 @@ extern bool SPIFFS_is_mounted;
 #endif /* PLATFORM_ESP32_H */
 
 #endif /* ESP32 */
+
+
