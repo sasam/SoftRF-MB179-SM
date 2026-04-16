@@ -1,6 +1,3 @@
-// ESP32.h workspace for Heltec WT port
-// Source: sasam/SoftRF-MB179-SM -> softrf-mb179-heltec-s3-sm/src/platform/ESP32.h
-// If the full file did not load previously, paste it here and we will edit it together.
 /*
  * Platform_ESP32.h
  * Copyright (C) 2018-2022 Linar Yusupov
@@ -136,15 +133,17 @@ extern Adafruit_NeoPixel strip;
 #error "This ESP32 family build variant is not supported!"
 #endif
 
-#define SOC_GPIO_PIN_STATUS   (hw_info.model != SOFTRF_MODEL_PRIME_MK2 ?\
-                                SOC_UNUSED_PIN :                        \
-                                (hw_info.revision == 2 ?                \
-                                  SOC_GPIO_PIN_TBEAM_LED_V02 :          \
-                                  (hw_info.revision == 5 ?              \
-                                    SOC_GPIO_PIN_TBEAM_LED_V05 :        \
-                                    ((hw_info.revision == 8 || hw_info.revision == 12) ?   \
-                                      SOC_GPIO_PIN_TBEAM_LED_V11 :      \
-                                      SOC_UNUSED_PIN))))
+#define SOC_GPIO_PIN_STATUS   (esp32_board == ESP32_HELTEC_TRACKER ?     \
+                                SOC_GPIO_PIN_HELTRK_LED :                \
+                                (hw_info.model != SOFTRF_MODEL_PRIME_MK2 ?\
+                                  SOC_UNUSED_PIN :                        \
+                                  (hw_info.revision == 2 ?                \
+                                    SOC_GPIO_PIN_TBEAM_LED_V02 :          \
+                                    (hw_info.revision == 5 ?              \
+                                      SOC_GPIO_PIN_TBEAM_LED_V05 :        \
+                                      ((hw_info.revision == 8 || hw_info.revision == 12) ?   \
+                                        SOC_GPIO_PIN_TBEAM_LED_V11 :      \
+                                        SOC_UNUSED_PIN)))))
 
 // #define SOC_GPIO_PIN_GNSS_PPS - replaced with GNSS.cpp get_pps_pin()
 
@@ -526,5 +525,3 @@ extern bool SPIFFS_is_mounted;
 #endif /* PLATFORM_ESP32_H */
 
 #endif /* ESP32 */
-
-
