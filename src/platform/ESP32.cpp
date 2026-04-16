@@ -182,6 +182,7 @@ extern bool loopTaskWDTEnabled;
 const char *ESP32S2_Device_Manufacturer = SOFTRF_IDENT;
 const char *ESP32S2_Device_Model = "Standalone Edition"; /* 303a:8132 */
 const char *ESP32S3_Device_Model = "Prime Edition Mk.3"; /* 303a:8133 */
+const char *ESP32S3_Model_Midi   = "Midi Edition";       /* 303a:81A0 */
 const uint16_t ESP32S2_Device_Version = SOFTRF_USB_FW_VERSION;
 
 #if defined(EXCLUDE_WIFI)
@@ -529,6 +530,7 @@ static void ESP32_setup()
      *  TTGO T5S V2.8   |            | BOYA_BY25Q32AL
      *  TTGO T5  4.7    | WROVER-E   | XMC_XM25QH128C
      *  TTGO T-Watch    |            | WINBOND_NEX_W25Q128_V
+     *  Heltec Tracker  |            | GIGADEVICE_GD25Q64
      *  Ai-T NodeMCU-S3 | ESP-S3-12K | GIGADEVICE_GD25Q64C
      *  TTGO T-Dongle   |            | BOYA_BY25Q32AL
      *  TTGO S3 Core    |            | GIGADEVICE_GD25Q64C
@@ -1085,11 +1087,13 @@ static void ESP32_setup()
     (defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3))
   if (USB.manufacturerName(ESP32S2_Device_Manufacturer)) {
     char usb_serial_number[16];
+
     uint16_t pid;
 
     pid = (esp32_board == ESP32_TTGO_T_BEAM_SUPREME) ? SOFTRF_USB_PID_PRIME_MK3  :
           (esp32_board == ESP32_S2_T8_V1_1         ) ? SOFTRF_USB_PID_WEBTOP     :
           (esp32_board == ESP32_S3_DEVKIT          ) ? SOFTRF_USB_PID_STANDALONE :
+          (esp32_board == ESP32_HELTEC_TRACKER     ) ? SOFTRF_USB_PID_MIDI       :
           USB_PID /* 0x1001 */ ;
 
     snprintf(usb_serial_number, sizeof(usb_serial_number),
@@ -1099,8 +1103,9 @@ static void ESP32_setup()
 
     USB.VID(USB_VID); // USB_ESPRESSIF_VID = 0x303A
     USB.PID(pid);
-    USB.productName(esp32_board == ESP32_TTGO_T_BEAM_SUPREME ?
-                    ESP32S3_Device_Model : ESP32S2_Device_Model);
+    USB.productName(esp32_board == ESP32_TTGO_T_BEAM_SUPREME ? ESP32S3_Device_Model :
+                    esp32_board == ESP32_HELTEC_TRACKER      ? ESP32S3_Model_Midi  :
+                                                           ESP32S2_Device_Model);
     USB.firmwareVersion(ESP32S2_Device_Version);
     USB.serialNumber(usb_serial_number);
     USB.begin();
