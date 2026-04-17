@@ -74,6 +74,9 @@ volatile unsigned long PPS_TimeMarker = 0;
 #if defined(ESP32)
 static uint8_t get_pps_pin()
 {
+    if (hw_info.model == SOFTRF_MODEL_MIDI) {
+        return SOC_GPIO_PIN_HELTRK_GNSS_PPS;
+    }
     if (hw_info.model == SOFTRF_MODEL_PRIME_MK3)
         return SOC_GPIO_PIN_S3_GNSS_PPS;
     if (hw_info.model == SOFTRF_MODEL_PRIME_MK2) {
