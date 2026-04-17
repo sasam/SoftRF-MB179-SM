@@ -559,6 +559,7 @@ static void ESP32_setup()
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)
     case MakeFlashId(GIGADEVICE_ID, GIGADEVICE_GD25Q64):
     default:
+      esp32_board   = ESP32_S3_DEVKIT;
       hw_info.model = SOFTRF_MODEL_PRIME_MK3;
 #else
 #error "This ESP32 family build variant is not supported!"
@@ -577,7 +578,19 @@ static void ESP32_setup()
 #elif defined(CONFIG_IDF_TARGET_ESP32S2)
     esp32_board      = ESP32_S2_T8_V1_1;
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)
-    esp32_board      = ESP32_S3_DEVKIT;
+    switch (flash_id)
+    {
+    case MakeFlashId(GIGADEVICE_ID, GIGADEVICE_GD25Q64):
+      /* Heltec Tracker has no PSRAM onboard */
+      esp32_board    = ESP32_HELTEC_TRACKER;
+      hw_info.model  = SOFTRF_MODEL_MIDI;
+      break;
+
+    default:
+      esp32_board    = ESP32_S3_DEVKIT;
+      hw_info.model  = SOFTRF_MODEL_PRIME_MK3;
+      break;
+    }
 #endif /* CONFIG_IDF_TARGET_ESP32 */
   }
 
@@ -1004,9 +1017,15 @@ static void ESP32_setup()
                        SOC_GPIO_PIN_S3_CONS_TX);
 #endif /* ARDUINO_USB_CDC_ON_BOOT */
 
-    lmic_pins.nss  = SOC_GPIO_PIN_S3_SS;
-    lmic_pins.rst  = SOC_GPIO_PIN_S3_RST;
-    lmic_pins.busy = SOC_GPIO_PIN_S3_BUSY;
+    if (esp32_board == ESP32_HELTEC_TRACKER) {
+      lmic_pins.nss  = SOC_GPIO_PIN_HELTRK_SS;
+      lmic_pins.rst  = SOC_GPIO_PIN_HELTRK_RST;
+      lmic_pins.busy = SOC_GPIO_PIN_HELTRK_BUSY;
+    } else {
+      lmic_pins.nss  = SOC_GPIO_PIN_S3_SS;
+      lmic_pins.rst  = SOC_GPIO_PIN_S3_RST;
+      lmic_pins.busy = SOC_GPIO_PIN_S3_BUSY;
+    }  
 
     ESP32_has_spiflash = SPIFlash->begin(possible_devices,
                                          EXTERNAL_FLASH_DEVICE_COUNT);
@@ -2108,6 +2127,10 @@ static void ESP32_SPI_begin()
       SPI.begin(SOC_GPIO_PIN_S3_SCK,  SOC_GPIO_PIN_S3_MISO,
                 SOC_GPIO_PIN_S3_MOSI, SOC_GPIO_PIN_S3_SS);
       break;
+    case ESP32_HELTEC_TRACKER:
+        SPI.begin(SOC_GPIO_PIN_HELTRK_SCK,  SOC_GPIO_PIN_HELTRK_MISO,
+                  SOC_GPIO_PIN_HELTRK_MOSI, SOC_GPIO_PIN_HELTRK_SS);
+      break;
     default:
       SPI.begin(SOC_GPIO_PIN_SCK,  SOC_GPIO_PIN_MISO,
                 SOC_GPIO_PIN_MOSI, SOC_GPIO_PIN_SS);
@@ -2177,6 +2200,14 @@ static void ESP32_swSer_begin(unsigned long baud)
                            SOC_GPIO_PIN_TBEAM_V05_RX,
                            SOC_GPIO_PIN_TBEAM_V05_TX);
     }
+  } else if (esp32_board == ESP32_HELTEC_TRACKER) {
+    Serial.print(F("INFO: Heltec Tracker rev. "));
+    Serial.print(hw_info.revision);
+    Serial.println(F(" is detected."));
+
+    Serial_GNSS_In.begin(baud, SERIAL_IN_BITS,
+                       SOC_GPIO_PIN_HELTRK_GNSS_RX,
+                       SOC_GPIO_PIN_HELTRK_GNSS_TX);
   } else if (hw_info.model == SOFTRF_MODEL_PRIME_MK3) {
 
     Serial.println(F("INFO: TTGO T-Beam Supreme is detected."));
