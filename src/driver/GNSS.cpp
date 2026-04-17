@@ -136,6 +136,7 @@ const char *GNSS_name[] = {
   [GNSS_MODULE_MAV]     = "MAV",
   [GNSS_MODULE_SONY]    = "SONY",
   [GNSS_MODULE_AT65]    = "AT65",
+  [GNSS_MODULE_UC65]    = "UC65",
   [GNSS_MODULE_MT33]    = "MT33",
   [GNSS_MODULE_GOKE]    = "GOKE"
 };
@@ -148,6 +149,7 @@ const char *GNSS_name[] = {
  * Goke: GGA - 185+, RMC - 265+
  * Neo6: GGA - 138 , RMC -  67
  * MT33: GGA -  48 , RMC - 175
+ * UC65: GGA -  35 , RMC -  29
  */
 
 gnss_stat_t gnss_stats;
@@ -1437,6 +1439,113 @@ const gnss_chip_ops_t at65_ops = {
 };
 #endif /* EXCLUDE_GNSS_AT65 */
 
+#if !defined(EXCLUDE_GNSS_UC65)
+static gnss_id_t uc65_probe()
+{
+  /* Firmware version request */
+  return nmea_handshake("$PDTINFO\r\n", "$PDTINFO,", false) ?
+                        GNSS_MODULE_UC65 : GNSS_MODULE_NMEA;
+}
+
+static bool uc65_setup()
+{
+#if !defined(EXCLUDE_LOG_GNSS_VERSION)
+  while (Serial_GNSS_In.available() > 0) { Serial_GNSS_In.read(); }
+
+  Serial_GNSS_Out.write("$PDTINFO\r\n");
+
+  int i=0;
+  char c;
+  unsigned long start_time = millis();
+
+  /* take response into buffer */
+  while ((millis() - start_time) < 2000) {
+
+    c = Serial_GNSS_In.read();
+
+    if (isPrintable(c) || c == '\r' || c == '\n') {
+      if (i >= sizeof(GNSSbuf) - 1) break;
+      GNSSbuf[i++] = c;
+    } else {
+      /* ignore */
+      continue;
+    }
+
+    if (c == '\n') break;
+  }
+
+  GNSSbuf[i] = 0;
+
+  size_t len = strlen((char *) &GNSSbuf[0]);
+
+  if (len > 9) {
+    for (int i=9; i < len; i++) {
+      if (GNSSbuf[i] == '*') {
+        GNSSbuf[i] = 0;
+      }
+    }
+    Serial.print(F("INFO: GNSS ident - "));
+    Serial.println((char *) &GNSSbuf[9]);
+  }
+
+  delay(250);
+#endif
+
+  /*
+   * Factory default:
+   * $CFGSYS,H35155 = GPS + BDS + GLO + GAL + QZSS + SBAS
+   * $CFGTP,1000000,500000,1,0,0,0 = PPS is enabled, 500 ms pulse, 1 s interval
+   *
+   * HTIT v1.0
+   * firmware "FB2S UM600,G1B1L1E1,V2.0,R6.0.0.0Build1280,N/A,N/A"
+   * $CFGGEOID,1*1F
+   * $CFGDYN,h00,0,0*55
+   *
+   * HTIT v1.1
+   * firmware "UC6580I,G1B1L1E1,V00,R6.0.0.0Build2810,2400615000268,20230316125509004"
+   * $CFGGEOID,0*1E
+   * $CFGDYN,h00,0,0*55
+   */
+
+#if 0
+  Serial_GNSS_Out.write("$CFGSYS,h1111\r\n"); /* GPS L1 + BDS B1I + GLO L1 + GAL E1 */
+  /* The receiver resets automatically after receiving the $CFGSYS command */
+  delay(500);
+#endif
+#if 0
+  Serial_GNSS_Out.write("$CFGSYS,h4004\r\n"); /* GPS L5 + GAL E5a */
+  /* The receiver resets automatically after receiving the $CFGSYS command */
+  delay(500);
+#endif
+
+  Serial_GNSS_Out.write("$CFGMSG,0,2,0\r\n"); delay(250); /* GSA off */
+  Serial_GNSS_Out.write("$CFGMSG,0,3,0\r\n"); delay(250); /* GSV off */
+  Serial_GNSS_Out.write("$CFGMSG,6,0,0\r\n"); delay(250); /* TXT off */
+
+  Serial_GNSS_Out.write("$CFGGEOID,1\r\n");   delay(250); /* enforce geoid height */
+
+  return true;
+}
+
+static void uc65_loop()
+{
+
+}
+
+static void uc65_fini()
+{
+
+}
+
+const gnss_chip_ops_t uc65_ops = {
+  uc65_probe,
+  uc65_setup,
+  uc65_loop,
+  uc65_fini,
+  35 /* GGA */, 29 /* RMC */
+};
+#endif /* EXCLUDE_GNSS_UC65 */
+
 static bool GNSS_fix_cache = false;
 static bool badGGA = true;
 
@@ -1705,6 +1814,10 @@ byte GNSS_setup() {
   gnss_id = (gnss_id == GNSS_MODULE_NMEA ?
               (gnss_chip = &at65_ops,   gnss_chip->probe()) : gnss_id);
 #endif /* EXCLUDE_GNSS_AT65 */
+#if !defined(EXCLUDE_GNSS_UC65)
+    gnss_id = (gnss_id == GNSS_MODULE_NMEA ?
+                      (gnss_chip = &uc65_ops,   gnss_chip->probe()) : gnss_id);
+#endif /* EXCLUDE_GNSS_UC65 */
 
   Serial.print("GNSS type found: ");
   Serial.println(GNSS_name[gnss_id]);

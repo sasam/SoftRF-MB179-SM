@@ -36,6 +36,7 @@ typedef enum
   GNSS_MODULE_MAV,  /* MAVLink */
   GNSS_MODULE_SONY, /* S7XG */
   GNSS_MODULE_AT65, /* AT6558 */
+  GNSS_MODULE_UC65, /* Unicore FirebirdII UC6580 */
   GNSS_MODULE_MT33, /* L80 */
   GNSS_MODULE_GOKE  /* Air530 */
 } gnss_id_t;
