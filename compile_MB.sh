@@ -1,12 +1,13 @@
-arduino-cli compile /home/sasa/Arduino/SoftRF_MB179 \
+arduino-cli compile /home/smihajlovic/pgm/SoftRF-MB179-SM \
   -e \
-  --libraries /home/sasa/Arduino/SoftRF_MB179/libraries_mb\
+  --libraries /home/smihajlovic/pgm/SoftRF-MB179-SM/libraries_mb \
   -b "esp32:esp32:esp32:CPUFreq=80,FlashSize=8M,PartitionScheme=default_8MB,EraseFlash=all" \
   --jobs 12 \
   --verbose \
   --clean
 
 ###
+# --libraries /home/sasa/Arduino/SoftRF_MB179/libraries_mb \
 # sa ovim radi
 #  -b "esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,CPUFreq=80,FlashSize=8M,PartitionScheme=default_8MB,EraseFlash=all" \
 #
